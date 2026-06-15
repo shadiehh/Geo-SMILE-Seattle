@@ -1,6 +1,7 @@
 # ============================================================
 # Geo-SMILE: Geo + Feature + Cell Explainability Pipeline
 # Extension of SMILE (Aslansefat) to spatial cases
+# Local explainer: feature importance computed per point
 # ============================================================
 
 # ============================================================
@@ -14,6 +15,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import seaborn as sns
 
 from tqdm import tqdm
@@ -59,7 +61,6 @@ if missing_cols:
     raise ValueError(f"Missing columns: {missing_cols}")
 
 data = data.dropna(subset=required_cols).reset_index(drop=True)
-
 X = data[features].copy()
 y = data[target].copy()
 
@@ -111,7 +112,7 @@ test_preds  = automl.predict(X_test)
 base_train_r2 = r2_score(y_train, train_preds)
 base_test_r2  = r2_score(y_test,  test_preds)
 
-print(f"\nBlack-box — Train R²: {base_train_r2:.4f} | Test R²: {base_test_r2:.4f}")
+print(f"\nBlack-box — Train R2: {base_train_r2:.4f} | Test R2: {base_test_r2:.4f}")
 
 original_preds  = train_preds.copy()
 baseline_values = X_train.median()
@@ -175,10 +176,8 @@ for j in tqdm(range(n_subsets), desc="Geo perturbations"):
 
     X_pert = X_train.copy()
     X_pert.iloc[idx] = baseline_values.values
-
     pert_preds = automl.predict(X_pert)
-    shift = wasserstein_distance(original_preds[idx], pert_preds[idx])
-    y_shifts_geo.append(shift)
+    y_shifts_geo.append(wasserstein_distance(original_preds[idx], pert_preds[idx]))
     M_geo[j, idx] = 1
 
 y_shifts_geo = np.array(y_shifts_geo)
@@ -195,7 +194,7 @@ M_geo_tr, M_geo_te, sg_tr, sg_te = train_test_split(
 
 best_k_geo, k_scores_geo = select_best_kernel(M_geo_tr, M_geo_te, sg_tr, sg_te)
 
-print("\nKernel R² — Geo branch:")
+print("\nKernel R2 — Geo branch:")
 for k, v in sorted(k_scores_geo.items(), key=lambda x: -x[1]):
     marker = " <- best" if k == best_k_geo else ""
     print(f"  {k:<14} {v:.4f}{marker}")
@@ -228,19 +227,22 @@ for k, v in geo_fidelity.items():
 geo_importance     = pd.Series(ridge_geo.coef_, index=X_train.index, name="geo_importance")
 geo_importance_abs = geo_importance.abs()
 
-print("\nGeo importance summary:")
-print(geo_importance_abs.describe())
-
 
 # ============================================================
-# Step 9: Feature Perturbations (K sets, feature masking)
+# Step 9: Feature Perturbations
+# ============================================================
+# K random binary masks over features.
+# For each perturbation, store the full prediction vector so
+# that local per-point feature importance can be computed
+# without extra model calls in Step 12.
 # ============================================================
 
 n_feats = len(features)
 K_feat  = 3000
 
-M_feat        = np.zeros((K_feat, n_feats), dtype=np.int8)
-y_shifts_feat = []
+M_feat               = np.zeros((K_feat, n_feats),  dtype=np.int8)
+all_pert_preds_feat  = np.zeros((K_feat, n_points), dtype=np.float32)
+y_shifts_feat        = []
 
 for j in tqdm(range(K_feat), desc="Feature perturbations"):
     mask = np.random.randint(0, 2, size=n_feats)
@@ -252,9 +254,8 @@ for j in tqdm(range(K_feat), desc="Feature perturbations"):
             X_pert[feat] = baseline_values[feat]
 
     pert_preds = automl.predict(X_pert)
-    # Wasserstein over all points (all are affected by feature masking)
-    shift = wasserstein_distance(original_preds, pert_preds)
-    y_shifts_feat.append(shift)
+    all_pert_preds_feat[j] = pert_preds
+    y_shifts_feat.append(wasserstein_distance(original_preds, pert_preds))
 
 y_shifts_feat = np.array(y_shifts_feat)
 print(f"\nFeature shifts — mean: {y_shifts_feat.mean():.4f}, std: {y_shifts_feat.std():.4f}")
@@ -270,7 +271,7 @@ M_feat_tr, M_feat_te, sf_tr, sf_te = train_test_split(
 
 best_k_feat, k_scores_feat = select_best_kernel(M_feat_tr, M_feat_te, sf_tr, sf_te)
 
-print("\nKernel R² — Feature branch:")
+print("\nKernel R2 — Feature branch:")
 for k, v in sorted(k_scores_feat.items(), key=lambda x: -x[1]):
     marker = " <- best" if k == best_k_feat else ""
     print(f"  {k:<14} {v:.4f}{marker}")
@@ -279,14 +280,18 @@ feat_w_tr = np.clip(apply_kernel(sf_tr, best_k_feat), 1e-8, None)
 
 
 # ============================================================
-# Step 11: Weighted Ridge Surrogate — Feature Branch
+# Step 11: Global Weighted Ridge — Feature Branch (fidelity)
+# ============================================================
+# A single global surrogate is kept solely to report fidelity
+# metrics comparable to the Geo branch. The actual feature
+# importance used for explanation comes from Step 12 (local).
 # ============================================================
 
-ridge_feat = Ridge(alpha=1.0)
-ridge_feat.fit(M_feat_tr, sf_tr, sample_weight=feat_w_tr)
+ridge_feat_global = Ridge(alpha=1.0)
+ridge_feat_global.fit(M_feat_tr, sf_tr, sample_weight=feat_w_tr)
 
-pred_feat_tr = ridge_feat.predict(M_feat_tr)
-pred_feat_te = ridge_feat.predict(M_feat_te)
+pred_feat_tr = ridge_feat_global.predict(M_feat_tr)
+pred_feat_te = ridge_feat_global.predict(M_feat_te)
 
 feat_fidelity = {
     "R2 Fidelity": r2_score(sf_te, pred_feat_te),
@@ -300,38 +305,69 @@ print(f"\nFeature surrogate fidelity (kernel={best_k_feat}):")
 for k, v in feat_fidelity.items():
     print(f"  {k}: {v:.6f}")
 
-feature_importance     = pd.Series(ridge_feat.coef_, index=features, name="feature_importance")
-feature_importance_abs = feature_importance.abs()
 
-print("\nFeature importance ranking:")
-display(feature_importance_abs.sort_values(ascending=False).to_frame())
+# ============================================================
+# Step 12: Local Feature Importance per Point
+# ============================================================
+# For each training point i:
+#   y_i[j] = predicted_preds[j][i] - original_preds[i]
+#          = how much perturbation j changed THIS point's output
+#   w_i[j] = kernel(|y_i[j]|)
+#          = weight by local prediction sensitivity
+#   Ridge(M_feat, y_i, w_i) -> coef_ = local feature importance for i
+#
+# Result: local_feat_imp_df  shape (n_points x n_features)
+# ============================================================
+
+local_feat_imp = np.zeros((n_points, n_feats), dtype=np.float32)
+
+for i in tqdm(range(n_points), desc="Local feature importance per point"):
+    y_i = all_pert_preds_feat[:, i] - original_preds[i]   # (K,)
+    w_i = np.clip(apply_kernel(np.abs(y_i), best_k_feat), 1e-8, None)
+
+    ridge_i = Ridge(alpha=1.0)
+    ridge_i.fit(M_feat, y_i, sample_weight=w_i)
+    local_feat_imp[i] = ridge_i.coef_
+
+local_feat_imp_df     = pd.DataFrame(local_feat_imp,     index=X_train.index, columns=features)
+local_feat_imp_abs_df = pd.DataFrame(np.abs(local_feat_imp), index=X_train.index, columns=features)
+
+# Global summary = mean local importance across all points
+feature_importance     = local_feat_imp_df.mean(axis=0)
+feature_importance_abs = local_feat_imp_abs_df.mean(axis=0)
+
+print("\nGlobal feature importance (mean of local):")
+display(feature_importance_abs.sort_values(ascending=False).to_frame("mean_local_importance"))
 
 
 # ============================================================
-# Step 12: Cell Explainability
+# Step 13: Cell Explainability
 # ============================================================
-# Both importance vectors are min-max normalized to [0, 1]
-# so that geo (n_points) and feature (n_features) scales are
-# equalized before combining.
-# cell[i, j] = geo_norm[i] * feat_norm[j]
-# Result: (n_points x n_features) matrix
+# geo_norm[i]           — how geographically important is point i
+# local_feat_norm[i, j] — how important is feature j at point i
+# cell[i, j] = geo_norm[i] * local_feat_norm[i, j]
+# Both dimensions vary spatially.
 # ============================================================
 
 _eps = 1e-12
 
-geo_norm  = (geo_importance_abs  - geo_importance_abs.min())  / (geo_importance_abs.max()  - geo_importance_abs.min()  + _eps)
-feat_norm = (feature_importance_abs - feature_importance_abs.min()) / (feature_importance_abs.max() - feature_importance_abs.min() + _eps)
+geo_norm = (geo_importance_abs - geo_importance_abs.min()) / \
+           (geo_importance_abs.max() - geo_importance_abs.min() + _eps)
 
-cell_matrix = np.outer(geo_norm.values, feat_norm.values)
+# Normalize local feature importance per feature column to [0, 1]
+feat_col_min = local_feat_imp_abs_df.min(axis=0)
+feat_col_max = local_feat_imp_abs_df.max(axis=0)
+local_feat_norm = (local_feat_imp_abs_df - feat_col_min) / \
+                  (feat_col_max - feat_col_min + _eps)
+
+cell_matrix = geo_norm.values[:, np.newaxis] * local_feat_norm.values
 cell_df     = pd.DataFrame(cell_matrix, index=geo_norm.index, columns=features)
 
 print("\nCell importance matrix shape:", cell_df.shape)
-print("Cell importance summary:")
-display(cell_df.describe())
 
 
 # ============================================================
-# Step 13: GeoDataFrame
+# Step 14: GeoDataFrame
 # ============================================================
 
 data_train = data.loc[X_train.index].copy()
@@ -340,14 +376,17 @@ data_train["geo_importance_abs"] = geo_importance_abs
 data_train["geo_norm"]           = geo_norm
 
 for feat in features:
-    data_train[f"cell_{feat}"] = cell_df[feat]
+    data_train[f"local_feat_{feat}"] = local_feat_imp_abs_df[feat]
+    data_train[f"cell_{feat}"]       = cell_df[feat]
+
+data_train["dominant_feature"] = local_feat_imp_abs_df.idxmax(axis=1)
 
 data_train["geometry"] = gpd.points_from_xy(data_train["UTM_X"], data_train["UTM_Y"])
 gdf_train = gpd.GeoDataFrame(data_train, geometry="geometry", crs="EPSG:32610")
 
 
 # ============================================================
-# Step 14: Map — Geo Importance (Absolute)
+# Step 15: Map — Geo Importance (Absolute)
 # ============================================================
 
 fig, ax = plt.subplots(figsize=(12, 8))
@@ -358,7 +397,7 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 15: Map — Geo Importance (Signed)
+# Step 16: Map — Geo Importance (Signed)
 # ============================================================
 
 fig, ax = plt.subplots(figsize=(12, 8))
@@ -369,18 +408,69 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 16: Bar Chart — Global Feature Importance
+# Step 17: Bar Chart — Global Feature Importance (mean local)
 # ============================================================
 
 fig, ax = plt.subplots(figsize=(10, 5))
 feature_importance_abs.sort_values().plot(kind="barh", ax=ax, color="steelblue")
-ax.set_title("Geo-SMILE: Global Feature Importance", fontsize=14)
-ax.set_xlabel("Importance Score")
+ax.set_title("Geo-SMILE: Global Feature Importance (mean of local)", fontsize=14)
+ax.set_xlabel("Mean Local Importance Score")
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 17: Heatmap — Cell Explainability (Top-30 Points)
+# Step 18: Maps — Local Feature Importance per Feature
+# ============================================================
+
+ncols = 3
+nrows = int(np.ceil(n_feats / ncols))
+
+fig, axes = plt.subplots(nrows, ncols, figsize=(18, nrows * 5))
+axes_flat = axes.flatten()
+
+for idx, feat in enumerate(features):
+    ax = axes_flat[idx]
+    gdf_train.plot(
+        column=f"local_feat_{feat}",
+        cmap="YlOrRd",
+        legend=True,
+        markersize=30,
+        ax=ax
+    )
+    ax.set_title(feat, fontsize=12)
+    ax.axis("equal")
+    ax.set_xlabel(""); ax.set_ylabel("")
+
+for idx in range(n_feats, len(axes_flat)):
+    axes_flat[idx].set_visible(False)
+
+fig.suptitle("Local Feature Importance — Spatial Distribution", fontsize=16, y=1.01)
+plt.tight_layout(); plt.show()
+
+
+# ============================================================
+# Step 19: Map — Dominant Feature per Point
+# ============================================================
+
+unique_feats = list(local_feat_imp_abs_df.idxmax(axis=1).unique())
+palette      = plt.cm.get_cmap("tab10", len(unique_feats))
+color_map    = {f: palette(i) for i, f in enumerate(unique_feats)}
+
+fig, ax = plt.subplots(figsize=(13, 9))
+
+for feat, color in color_map.items():
+    subset = gdf_train[gdf_train["dominant_feature"] == feat]
+    if len(subset) > 0:
+        subset.plot(ax=ax, color=color, markersize=55, label=feat, alpha=0.85)
+
+ax.legend(title="Dominant Feature", bbox_to_anchor=(1.01, 1), loc="upper left")
+ax.set_title("Geo-SMILE: Dominant Feature Driver per Point", fontsize=15)
+ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+plt.tight_layout(); plt.show()
+
+
+# ============================================================
+# Step 20: Heatmap — Cell Explainability (Top-30 Points)
 # ============================================================
 
 top30_idx = geo_importance_abs.nlargest(30).index
@@ -401,7 +491,7 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 18: Map — Cell Importance for Top Feature
+# Step 21: Map — Cell Importance for Top Feature
 # ============================================================
 
 top_feature = feature_importance_abs.idxmax()
@@ -415,24 +505,19 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 19: Wasserstein Shift Distributions
+# Step 22: Wasserstein Shift Distributions
 # ============================================================
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
 sns.histplot(y_shifts_geo,  bins=30, kde=True, ax=axes[0])
-axes[0].set_title("Wasserstein Shifts — Geo Branch")
-axes[0].set_xlabel("Shift")
-
+axes[0].set_title("Wasserstein Shifts — Geo Branch"); axes[0].set_xlabel("Shift")
 sns.histplot(y_shifts_feat, bins=30, kde=True, ax=axes[1], color="darkorange")
-axes[1].set_title("Wasserstein Shifts — Feature Branch")
-axes[1].set_xlabel("Shift")
-
+axes[1].set_title("Wasserstein Shifts — Feature Branch"); axes[1].set_xlabel("Shift")
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 20: Observed vs Predicted Shifts
+# Step 23: Observed vs Predicted Shifts (global surrogates)
 # ============================================================
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -441,21 +526,18 @@ for ax, obs, pred, title in [
     (axes[0], sg_te, pred_geo_te,
      f"Geo Surrogate (R2={geo_fidelity['R2 Fidelity']:.3f}, kernel={best_k_geo})"),
     (axes[1], sf_te, pred_feat_te,
-     f"Feature Surrogate (R2={feat_fidelity['R2 Fidelity']:.3f}, kernel={best_k_feat})")
+     f"Feature Surrogate — global (R2={feat_fidelity['R2 Fidelity']:.3f}, kernel={best_k_feat})")
 ]:
     ax.scatter(obs, pred, alpha=0.6)
-    lo = min(obs.min(), pred.min())
-    hi = max(obs.max(), pred.max())
+    lo, hi = min(obs.min(), pred.min()), max(obs.max(), pred.max())
     ax.plot([lo, hi], [lo, hi], "--", color="red")
-    ax.set_title(title)
-    ax.set_xlabel("Observed Shift")
-    ax.set_ylabel("Predicted Shift")
+    ax.set_title(title); ax.set_xlabel("Observed Shift"); ax.set_ylabel("Predicted Shift")
 
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 21: Surrogate Model Comparison (both branches)
+# Step 24: Surrogate Model Comparison
 # ============================================================
 
 SURROGATES = {
@@ -467,7 +549,6 @@ SURROGATES = {
     "XGBoost":       xgb.XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.1, verbosity=0, random_state=42),
     "LightGBM":      lgb.LGBMRegressor(n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42, verbose=-1),
 }
-
 WEIGHT_SUPPORT = {"Ridge", "Decision Tree", "Random Forest", "XGBoost", "LightGBM"}
 
 geo_r2s  = {}
@@ -477,11 +558,8 @@ for name, model in SURROGATES.items():
     kw_geo  = {"sample_weight": geo_w_tr}  if name in WEIGHT_SUPPORT else {}
     kw_feat = {"sample_weight": feat_w_tr} if name in WEIGHT_SUPPORT else {}
 
-    model.fit(M_geo_tr,  sg_tr, **kw_geo)
-    geo_r2s[name] = r2_score(sg_te, model.predict(M_geo_te))
-
-    model.fit(M_feat_tr, sf_tr, **kw_feat)
-    feat_r2s[name] = r2_score(sf_te, model.predict(M_feat_te))
+    model.fit(M_geo_tr,  sg_tr, **kw_geo);  geo_r2s[name]  = r2_score(sg_te, model.predict(M_geo_te))
+    model.fit(M_feat_tr, sf_tr, **kw_feat); feat_r2s[name] = r2_score(sf_te, model.predict(M_feat_te))
 
 comparison_df = pd.DataFrame({
     "Model":      list(geo_r2s.keys()),
@@ -493,52 +571,43 @@ print("\nSurrogate model comparison:")
 display(comparison_df)
 
 fig, ax = plt.subplots(figsize=(10, 5))
-x = np.arange(len(comparison_df))
-w = 0.35
+x = np.arange(len(comparison_df)); w = 0.35
 ax.bar(x - w/2, comparison_df["Geo R2"],     w, label="Geo Branch",     color="steelblue")
 ax.bar(x + w/2, comparison_df["Feature R2"], w, label="Feature Branch", color="darkorange")
-ax.set_xticks(x)
-ax.set_xticklabels(comparison_df["Model"], rotation=45, ha="right")
-ax.set_ylabel("Test R2")
-ax.set_title("Surrogate Model Comparison — Geo vs Feature Branch")
+ax.set_xticks(x); ax.set_xticklabels(comparison_df["Model"], rotation=45, ha="right")
+ax.set_ylabel("Test R2"); ax.set_title("Surrogate Model Comparison — Geo vs Feature")
 ax.legend(); ax.grid(axis="y")
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 22: Stability — Geo Branch
+# Step 25: Stability — Geo Branch
 # ============================================================
 
 n_repeats_stab = 10
 n_subsets_stab = 1000
-top_pct_geo    = 20   # top-20% for geo (many points)
-top_pct_feat   = 50   # top-50% for feature (only 10 features)
+top_pct_geo    = 20
 
 geo_runs     = []
 geo_fid_runs = []
 
 for seed in tqdm(range(10, 10 + n_repeats_stab), desc="Geo stability runs"):
     np.random.seed(seed)
-    M_r = np.zeros((n_subsets_stab, n_points), dtype=np.int8)
-    ys  = []
+    M_r = np.zeros((n_subsets_stab, n_points), dtype=np.int8); ys = []
 
     for j in range(n_subsets_stab):
         g   = np.random.randint(min_groups, max_groups + 1)
         sel = np.random.choice(n_groups, size=g, replace=False)
         idx = np.where(np.isin(spatial_group_labels, sel))[0]
-        if len(idx) == 0:
-            ys.append(0.0); continue
-        X_p = X_train.copy()
-        X_p.iloc[idx] = baseline_values.values
+        if len(idx) == 0: ys.append(0.0); continue
+        X_p = X_train.copy(); X_p.iloc[idx] = baseline_values.values
         pp  = automl.predict(X_p)
-        ys.append(wasserstein_distance(original_preds[idx], pp[idx]))
-        M_r[j, idx] = 1
+        ys.append(wasserstein_distance(original_preds[idx], pp[idx])); M_r[j, idx] = 1
 
     ys = np.array(ys)
     Mt, Me, st, se = train_test_split(M_r, ys, test_size=0.25, random_state=42)
     w  = np.clip(apply_kernel(st, best_k_geo), 1e-8, None)
-    rr = Ridge(alpha=1.0)
-    rr.fit(Mt, st, sample_weight=w)
+    rr = Ridge(alpha=1.0); rr.fit(Mt, st, sample_weight=w)
     geo_fid_runs.append(r2_score(se, rr.predict(Me)))
     geo_runs.append(pd.Series(rr.coef_, index=X_train.index).abs())
 
@@ -546,123 +615,111 @@ geo_runs_df = pd.DataFrame(geo_runs).T
 geo_runs_df.columns = [f"run_{i+1}" for i in range(n_repeats_stab)]
 
 geo_sp, geo_pr, geo_jc = [], [], []
-
 for a, b in combinations(geo_runs_df.columns, 2):
     sa, sb = geo_runs_df[a].values, geo_runs_df[b].values
-    geo_sp.append(spearmanr(sa, sb)[0])
-    geo_pr.append(pearsonr(sa, sb)[0])
-    ta = np.percentile(sa, 100 - top_pct_geo)
-    tb = np.percentile(sb, 100 - top_pct_geo)
-    A  = set(geo_runs_df.index[sa >= ta])
-    B  = set(geo_runs_df.index[sb >= tb])
+    geo_sp.append(spearmanr(sa, sb)[0]); geo_pr.append(pearsonr(sa, sb)[0])
+    ta = np.percentile(sa, 100 - top_pct_geo); tb = np.percentile(sb, 100 - top_pct_geo)
+    A  = set(geo_runs_df.index[sa >= ta]); B = set(geo_runs_df.index[sb >= tb])
     geo_jc.append(len(A & B) / len(A | B) if (A | B) else 1.0)
 
 geo_stability = {
-    "Fidelity R2 Mean":              np.mean(geo_fid_runs),
-    "Fidelity R2 Std":               np.std(geo_fid_runs),
-    "Spearman Stability Mean":       np.nanmean(geo_sp),
-    "Spearman Stability Std":        np.nanstd(geo_sp),
-    "Pearson Stability Mean":        np.nanmean(geo_pr),
-    "Pearson Stability Std":         np.nanstd(geo_pr),
+    "Fidelity R2 Mean":                 np.mean(geo_fid_runs),
+    "Fidelity R2 Std":                  np.std(geo_fid_runs),
+    "Spearman Stability Mean":          np.nanmean(geo_sp),
+    "Spearman Stability Std":           np.nanstd(geo_sp),
+    "Pearson Stability Mean":           np.nanmean(geo_pr),
+    "Pearson Stability Std":            np.nanstd(geo_pr),
     f"Jaccard Top-{top_pct_geo}% Mean": np.nanmean(geo_jc),
     f"Jaccard Top-{top_pct_geo}% Std":  np.nanstd(geo_jc),
 }
-
 print("\n--- Geo Stability ---")
-for k, v in geo_stability.items():
-    print(f"  {k}: {v:.4f}")
+for k, v in geo_stability.items(): print(f"  {k}: {v:.4f}")
 
 
 # ============================================================
-# Step 23: Stability — Feature Branch
+# Step 26: Stability — Feature Branch (local importance)
+# ============================================================
+# Each repeat re-runs K feature perturbations with a new seed,
+# computes local importance per point, then compares the
+# resulting (n_points x n_features) matrices pairwise.
 # ============================================================
 
-feat_runs     = []
-feat_fid_runs = []
+top_pct_feat   = 50
+feat_runs      = []
+feat_fid_runs  = []
 
 for seed in tqdm(range(10, 10 + n_repeats_stab), desc="Feature stability runs"):
     np.random.seed(seed)
-    M_r = np.zeros((n_subsets_stab, n_feats), dtype=np.int8)
-    ys  = []
+    M_r   = np.zeros((n_subsets_stab, n_feats),  dtype=np.int8)
+    pp_r  = np.zeros((n_subsets_stab, n_points), dtype=np.float32)
+    ys    = []
 
     for j in range(n_subsets_stab):
-        mask = np.random.randint(0, 2, size=n_feats)
-        M_r[j] = mask
-        X_p = X_train.copy()
+        mask = np.random.randint(0, 2, size=n_feats); M_r[j] = mask
+        X_p  = X_train.copy()
         for ki, feat in enumerate(features):
-            if mask[ki] == 0:
-                X_p[feat] = baseline_values[feat]
-        pp = automl.predict(X_p)
+            if mask[ki] == 0: X_p[feat] = baseline_values[feat]
+        pp   = automl.predict(X_p); pp_r[j] = pp
         ys.append(wasserstein_distance(original_preds, pp))
 
     ys = np.array(ys)
     Mt, Me, st, se = train_test_split(M_r, ys, test_size=0.25, random_state=42)
     w  = np.clip(apply_kernel(st, best_k_feat), 1e-8, None)
-    rr = Ridge(alpha=1.0)
-    rr.fit(Mt, st, sample_weight=w)
+    rr = Ridge(alpha=1.0); rr.fit(Mt, st, sample_weight=w)
     feat_fid_runs.append(r2_score(se, rr.predict(Me)))
-    feat_runs.append(pd.Series(rr.coef_, index=features).abs())
 
-feat_runs_df = pd.DataFrame(feat_runs).T
-feat_runs_df.columns = [f"run_{i+1}" for i in range(n_repeats_stab)]
+    # Local feature importance for this repeat
+    loc_r = np.zeros((n_points, n_feats), dtype=np.float32)
+    for i in range(n_points):
+        y_i = pp_r[:, i] - original_preds[i]
+        w_i = np.clip(apply_kernel(np.abs(y_i), best_k_feat), 1e-8, None)
+        rri = Ridge(alpha=1.0); rri.fit(M_r, y_i, sample_weight=w_i)
+        loc_r[i] = rri.coef_
+    feat_runs.append(np.abs(loc_r).flatten())
+
+feat_runs_arr = np.array(feat_runs)   # (n_repeats x (n_points * n_feats))
 
 feat_sp, feat_pr, feat_jc = [], [], []
-
-for a, b in combinations(feat_runs_df.columns, 2):
-    sa, sb = feat_runs_df[a].values, feat_runs_df[b].values
-    feat_sp.append(spearmanr(sa, sb)[0])
-    feat_pr.append(pearsonr(sa, sb)[0])
-    ta = np.percentile(sa, 100 - top_pct_feat)
-    tb = np.percentile(sb, 100 - top_pct_feat)
-    A  = set(feat_runs_df.index[sa >= ta])
-    B  = set(feat_runs_df.index[sb >= tb])
+for a, b in combinations(range(n_repeats_stab), 2):
+    sa, sb = feat_runs_arr[a], feat_runs_arr[b]
+    feat_sp.append(spearmanr(sa, sb)[0]); feat_pr.append(pearsonr(sa, sb)[0])
+    ta = np.percentile(sa, 100 - top_pct_feat); tb = np.percentile(sb, 100 - top_pct_feat)
+    A  = set(np.where(sa >= ta)[0]); B = set(np.where(sb >= tb)[0])
     feat_jc.append(len(A & B) / len(A | B) if (A | B) else 1.0)
 
 feat_stability = {
-    "Fidelity R2 Mean":              np.mean(feat_fid_runs),
-    "Fidelity R2 Std":               np.std(feat_fid_runs),
-    "Spearman Stability Mean":       np.nanmean(feat_sp),
-    "Spearman Stability Std":        np.nanstd(feat_sp),
-    "Pearson Stability Mean":        np.nanmean(feat_pr),
-    "Pearson Stability Std":         np.nanstd(feat_pr),
+    "Fidelity R2 Mean":                  np.mean(feat_fid_runs),
+    "Fidelity R2 Std":                   np.std(feat_fid_runs),
+    "Spearman Stability Mean":           np.nanmean(feat_sp),
+    "Spearman Stability Std":            np.nanstd(feat_sp),
+    "Pearson Stability Mean":            np.nanmean(feat_pr),
+    "Pearson Stability Std":             np.nanstd(feat_pr),
     f"Jaccard Top-{top_pct_feat}% Mean": np.nanmean(feat_jc),
     f"Jaccard Top-{top_pct_feat}% Std":  np.nanstd(feat_jc),
 }
-
 print("\n--- Feature Stability ---")
-for k, v in feat_stability.items():
-    print(f"  {k}: {v:.4f}")
+for k, v in feat_stability.items(): print(f"  {k}: {v:.4f}")
 
 
 # ============================================================
-# Step 24: Sparsity & Entropy — helper function
+# Step 27: Sparsity & Entropy — helper
 # ============================================================
 
 def sparsity_entropy_metrics(scores_raw, label=""):
-    s   = np.nan_to_num(np.asarray(scores_raw, dtype=float), nan=0.0)
-    n   = len(s)
-    eps = 1e-12
+    s = np.nan_to_num(np.asarray(scores_raw, dtype=float), nan=0.0)
+    n = len(s); eps = 1e-12
 
-    # Sparsity
-    q90          = np.percentile(s, 90)
-    top10_ratio  = (s >= q90).sum() / n
-
-    l1_n = np.sum(np.abs(s))
-    l2_n = np.sqrt(np.sum(s ** 2))
+    q90         = np.percentile(s, 90)
+    top10_ratio = (s >= q90).sum() / n
+    l1_n = np.sum(np.abs(s)); l2_n = np.sqrt(np.sum(s ** 2))
     hoyer = (np.sqrt(n) - l1_n / (l2_n + eps)) / (np.sqrt(n) - 1) if l2_n > eps else np.nan
+    sorted_s = np.sort(s); cumul = np.cumsum(sorted_s)
+    gini  = (n + 1 - 2 * np.sum(cumul) / (cumul[-1] + eps)) / n if cumul[-1] > eps else np.nan
 
-    sorted_s = np.sort(s)
-    cumul    = np.cumsum(sorted_s)
-    gini     = (n + 1 - 2 * np.sum(cumul) / (cumul[-1] + eps)) / n if cumul[-1] > eps else np.nan
-
-    # Entropy
     total = s.sum()
     if total > eps:
-        p        = s[s > 0] / total
-        ent      = -np.sum(p * np.log(p))
-        norm_ent = ent / np.log(n)
-        eff_n    = np.exp(ent)
-        eff_r    = eff_n / n
+        p = s[s > 0] / total; ent = -np.sum(p * np.log(p))
+        norm_ent = ent / np.log(n); eff_n = np.exp(ent); eff_r = eff_n / n
     else:
         ent = norm_ent = eff_n = eff_r = np.nan
 
@@ -675,38 +732,34 @@ def sparsity_entropy_metrics(scores_raw, label=""):
         "Effective N":          eff_n,
         "Effective Ratio":      eff_r,
     }
-
     print(f"\n--- Sparsity & Entropy ({label}) ---")
     for k, v in metrics.items():
-        val_str = f"{v:.4f}" if (v is not None and not np.isnan(v)) else "NaN"
-        print(f"  {k}: {val_str}")
-
+        print(f"  {k}: {v:.4f}" if not (v is None or np.isnan(v)) else f"  {k}: NaN")
     return metrics
 
 
-geo_sp_ent  = sparsity_entropy_metrics(geo_importance_abs.values,     label="Geo")
-feat_sp_ent = sparsity_entropy_metrics(feature_importance_abs.values,  label="Feature")
-cell_sp_ent = sparsity_entropy_metrics(cell_matrix.flatten(),           label="Cell (flattened)")
+geo_sp_ent   = sparsity_entropy_metrics(geo_importance_abs.values,         label="Geo")
+feat_sp_ent  = sparsity_entropy_metrics(feature_importance_abs.values,      label="Feature (mean local)")
+local_sp_ent = sparsity_entropy_metrics(local_feat_imp_abs_df.values.flatten(), label="Local Feature (all)")
+cell_sp_ent  = sparsity_entropy_metrics(cell_matrix.flatten(),               label="Cell")
 
 
 # ============================================================
-# Step 25: Combined Evaluation Table
+# Step 28: Combined Evaluation Table
 # ============================================================
 
-def _make_rows(metrics, branch, category):
-    return [
-        {"Branch": branch, "Category": category, "Metric": k, "Value": v}
-        for k, v in metrics.items()
-    ]
+def _rows(metrics, branch, category):
+    return [{"Branch": branch, "Category": category, "Metric": k, "Value": v}
+            for k, v in metrics.items()]
 
 rows = (
-    _make_rows(geo_fidelity,  "Geo",     "Fidelity")  +
-    _make_rows(feat_fidelity, "Feature", "Fidelity")  +
-    _make_rows(geo_stability,  "Geo",    "Stability") +
-    _make_rows(feat_stability, "Feature","Stability") +
-    _make_rows(geo_sp_ent,   "Geo",     "Sparsity/Entropy") +
-    _make_rows(feat_sp_ent,  "Feature", "Sparsity/Entropy") +
-    _make_rows(cell_sp_ent,  "Cell",    "Sparsity/Entropy")
+    _rows(geo_fidelity,  "Geo",     "Fidelity")        +
+    _rows(feat_fidelity, "Feature", "Fidelity")        +
+    _rows(geo_stability,  "Geo",    "Stability")       +
+    _rows(feat_stability, "Feature","Stability")       +
+    _rows(geo_sp_ent,    "Geo",     "Sparsity/Entropy") +
+    _rows(feat_sp_ent,   "Feature", "Sparsity/Entropy") +
+    _rows(cell_sp_ent,   "Cell",    "Sparsity/Entropy")
 )
 
 eval_df = pd.DataFrame(rows)
@@ -715,43 +768,31 @@ display(eval_df)
 
 
 # ============================================================
-# Step 26: Stability Maps — Geo Branch
+# Step 29: Stability Maps — Geo Branch
 # ============================================================
 
 gdf_train["geo_imp_mean"] = geo_runs_df.mean(axis=1).reindex(gdf_train.index)
 gdf_train["geo_imp_std"]  = geo_runs_df.std(axis=1).reindex(gdf_train.index)
-eps_cv = 1e-12
-gdf_train["geo_imp_cv"] = gdf_train["geo_imp_std"] / (gdf_train["geo_imp_mean"] + eps_cv)
 
 fig, axes = plt.subplots(1, 2, figsize=(20, 8))
-
 gdf_train.plot(column="geo_imp_mean", cmap="plasma", legend=True, markersize=40, ax=axes[0])
-axes[0].set_title("Geo Importance — Repeated-Run Mean", fontsize=13)
-axes[0].axis("equal")
-
-gdf_train.plot(column="geo_imp_std", cmap="magma", legend=True, markersize=40, ax=axes[1])
-axes[1].set_title("Geo Importance — Instability (Std)", fontsize=13)
-axes[1].axis("equal")
-
+axes[0].set_title("Geo Importance — Repeated-Run Mean", fontsize=13); axes[0].axis("equal")
+gdf_train.plot(column="geo_imp_std",  cmap="magma",   legend=True, markersize=40, ax=axes[1])
+axes[1].set_title("Geo Importance — Instability (Std)", fontsize=13); axes[1].axis("equal")
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 27: Top-10% Sparse Important Points Map
+# Step 30: Top-10% Sparse Important Points Map
 # ============================================================
 
 q90_geo = np.percentile(geo_importance_abs.values, 90)
 gdf_train["top10_geo"] = (geo_importance_abs >= q90_geo).astype(int)
 
 fig, ax = plt.subplots(figsize=(12, 8))
-
-gdf_train[gdf_train["top10_geo"] == 0].plot(
-    ax=ax, markersize=15, alpha=0.20, color="lightgrey"
-)
-gdf_train[gdf_train["top10_geo"] == 1].plot(
-    ax=ax, markersize=70, color="red", alpha=0.85, label="Top 10% Geo Importance"
-)
-
+gdf_train[gdf_train["top10_geo"] == 0].plot(ax=ax, markersize=15, alpha=0.20, color="lightgrey")
+gdf_train[gdf_train["top10_geo"] == 1].plot(ax=ax, markersize=70, color="red", alpha=0.85,
+                                             label="Top 10% Geo Importance")
 ax.legend()
 ax.set_title("Geo-SMILE Sparse Important Points: Top 10%", fontsize=15)
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
