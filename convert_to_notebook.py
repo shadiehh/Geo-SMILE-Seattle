@@ -42,17 +42,17 @@ cells.append(make_md_cell(
     "**How to run:** Import this notebook into Kaggle and attach the dataset `shadiemohammadi/ziqi-seattle`.\n"
     "\n"
     "Branches:\n"
-    "- **Geo Branch** — spatial-group perturbations → distributional geo importance (collective)\n"
-    "- **Feature Branch** — feature masking with combined `geo_dist` feature → per-point local geo importance + per-point feature importance\n"
-    "- **Cell Explainability** — combined (n_points × n_features) importance matrix\n"
+    "- **Geo Branch** — group-level spatial perturbations (KMeans clusters) → property-indexed distributional geo score (collective, not locally fitted)\n"
+    "- **Feature Branch** — player-based masking (UTM_X+UTM_Y joined as one `location` player) → genuinely local per-property player importance, with per-property local fidelity\n"
+    "- **Cell Explainability** — combined (n_points × n_players) importance matrix\n"
     "\n"
-    "`geo_dist` = standardised Euclidean distance from dataset centroid, replacing separate UTM_X/UTM_Y in the model (consistent with Chicago dataset design).\n"
+    "Includes GeoSHAPLY-style comparison plots: beeswarm summary (Fig 8), per-feature dependence plots with LOWESS trend + bootstrap CI band (Fig 9), and signed location/interaction maps over a real CartoDB basemap (Fig 10).\n"
     "\n"
     "Metrics: Fidelity · Stability · Sparsity · Entropy (no ground truth required)"
 ))
 
 # pip install cell
-cells.append(make_code_cell("!pip install flaml -q"))
+cells.append(make_code_cell("!pip install flaml contextily -q"))
 
 # code cells from source
 for block in raw_cells:

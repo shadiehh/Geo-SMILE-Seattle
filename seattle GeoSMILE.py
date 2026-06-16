@@ -16,9 +16,11 @@ import pandas as pd
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import contextily as ctx
 
 from tqdm import tqdm
 from scipy.stats import wasserstein_distance, spearmanr, pearsonr
+from statsmodels.nonparametric.smoothers_lowess import lowess
 from itertools import combinations
 
 from sklearn.model_selection import train_test_split
@@ -442,6 +444,18 @@ data_train["geometry"] = gpd.points_from_xy(data_train["UTM_X"], data_train["UTM
 gdf_train = gpd.GeoDataFrame(data_train, geometry="geometry", crs="EPSG:32610")
 
 
+def add_basemap(ax, source=None):
+    """Add a real city basemap (OpenStreetMap / CARTO tiles) beneath the
+    plotted points, reprojected on the fly to the GeoDataFrame's CRS
+    (GeoSHAPLY Fig 10 style). Fails silently if no internet access."""
+    if source is None:
+        source = ctx.providers.CartoDB.Positron
+    try:
+        ctx.add_basemap(ax, crs=gdf_train.crs.to_string(), source=source, attribution_size=6)
+    except Exception as e:
+        print(f"  (basemap unavailable — {e})")
+
+
 # ============================================================
 # Step 15: Map — Distributional Geo Score (Absolute)
 # ============================================================
@@ -452,9 +466,11 @@ gdf_train = gpd.GeoDataFrame(data_train, geometry="geometry", crs="EPSG:32610")
 # ============================================================
 
 fig, ax = plt.subplots(figsize=(12, 8))
-gdf_train.plot(column="geo_importance_abs", cmap="plasma", legend=True, markersize=50, ax=ax)
+gdf_train.plot(column="geo_importance_abs", cmap="plasma", legend=True,
+               markersize=50, alpha=0.85, ax=ax)
+add_basemap(ax)
 ax.set_title("Geo-SMILE: Property-Indexed Distributional Geo Score (|Cluster|)", fontsize=14)
-ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
 
@@ -465,11 +481,12 @@ plt.tight_layout(); plt.show()
 _geo_abs_max = geo_importance.abs().max()
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(
-    column="geo_importance", cmap="RdBu_r", legend=True, markersize=50, ax=ax,
+    column="geo_importance", cmap="RdBu_r", legend=True, markersize=50, alpha=0.85, ax=ax,
     vmin=-_geo_abs_max, vmax=_geo_abs_max
 )
+add_basemap(ax)
 ax.set_title("Geo-SMILE: Signed Distributional Geo Score (GeoSHAPLY Fig 10a Style)", fontsize=14)
-ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
 
@@ -485,11 +502,12 @@ plt.tight_layout(); plt.show()
 _loc_abs_max = gdf_train["local_signed_location"].abs().max()
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(
-    column="local_signed_location", cmap="RdBu_r", legend=True, markersize=50, ax=ax,
+    column="local_signed_location", cmap="RdBu_r", legend=True, markersize=50, alpha=0.85, ax=ax,
     vmin=-_loc_abs_max, vmax=_loc_abs_max
 )
+add_basemap(ax)
 ax.set_title("Geo-SMILE: Local Location Player Importance per Property (GeoSHAPLY Fig 10a)", fontsize=14)
-ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
 # Fig 10b equivalent: signed cell map for strongest non-location interacting player
@@ -499,13 +517,14 @@ _cell_abs_max   = gdf_train[f"cell_signed_{_strongest_cell}"].abs().max()
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(
     column=f"cell_signed_{_strongest_cell}", cmap="RdBu_r", legend=True,
-    markersize=50, ax=ax, vmin=-_cell_abs_max, vmax=_cell_abs_max
+    markersize=50, alpha=0.85, ax=ax, vmin=-_cell_abs_max, vmax=_cell_abs_max
 )
+add_basemap(ax)
 ax.set_title(
     f"Geo-SMILE: {_strongest_cell} × Location Interaction (GeoSHAPLY Fig 10b Style)",
     fontsize=14
 )
-ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
 
@@ -556,6 +575,72 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
+# Step 17c: Dependence Plots — % Change in Price per Feature (GeoSHAPLY Fig 9 Style)
+# ============================================================
+# For each non-spatial player: x-axis = raw feature value, y-axis = % change
+# in price implied by that property's local signed importance
+# (100 * (exp(local_signed_importance) - 1), since target = log_price).
+# Red dashed line = LOWESS smooth; grey band = 95% bootstrap CI of the smooth.
+# "location" is 2-D and is shown as a map (Steps 16b/18), not a 1-D dependence plot.
+# ============================================================
+
+def _dependence_plot(ax, raw_vals, signed_local_imp, label, n_boot=80, frac=0.5):
+    raw_vals = np.asarray(raw_vals, dtype=float)
+    pct_change = 100.0 * (np.exp(np.asarray(signed_local_imp, dtype=float)) - 1.0)
+
+    order   = np.argsort(raw_vals)
+    x_sorted = raw_vals[order]
+    y_sorted = pct_change[order]
+    n = len(x_sorted)
+
+    fit  = lowess(y_sorted, x_sorted, frac=frac, return_sorted=True)
+    grid = fit[:, 0]
+
+    boot_curves = []
+    for _ in range(n_boot):
+        idx = np.random.choice(n, size=n, replace=True)
+        bx, by = x_sorted[idx], y_sorted[idx]
+        s = np.argsort(bx)
+        try:
+            bf = lowess(by[s], bx[s], frac=frac, return_sorted=True)
+            boot_curves.append(np.interp(grid, bf[:, 0], bf[:, 1]))
+        except Exception:
+            continue
+
+    ax.scatter(x_sorted, y_sorted, s=8, alpha=0.35, color="#3477b5", linewidths=0)
+    if boot_curves:
+        boot_curves = np.array(boot_curves)
+        lower = np.percentile(boot_curves, 2.5, axis=0)
+        upper = np.percentile(boot_curves, 97.5, axis=0)
+        ax.fill_between(grid, lower, upper, color="grey", alpha=0.3)
+    ax.plot(grid, fit[:, 1], color="red", linestyle="--", lw=1.5)
+    ax.axhline(0, color="black", lw=0.6, ls=":")
+    ax.set_xlabel(label, fontsize=11)
+    ax.set_ylabel("% change in price", fontsize=10)
+
+
+_dep_players = [p for p in players if p != "location"]
+_ncols_dep   = 4
+_nrows_dep   = int(np.ceil(len(_dep_players) / _ncols_dep))
+
+np.random.seed(0)
+fig, axes = plt.subplots(_nrows_dep, _ncols_dep, figsize=(22, _nrows_dep * 4.5))
+axes_flat = np.atleast_1d(axes).flatten()
+
+for idx, player in enumerate(_dep_players):
+    _dependence_plot(axes_flat[idx], X_train[player].values, local_feat_imp_df[player].values, player)
+
+for idx in range(len(_dep_players), len(axes_flat)):
+    axes_flat[idx].set_visible(False)
+
+fig.suptitle(
+    "Non-linear Effects of Housing Features on House Price (GeoSHAPLY Fig 9 Style)",
+    fontsize=15, y=1.02
+)
+plt.tight_layout(); plt.show()
+
+
+# ============================================================
 # Step 18: Maps — Local Player Importance (GeoSHAPLY Fig 9 Style)
 # ============================================================
 
@@ -569,10 +654,11 @@ for idx, player in enumerate(players):
     ax   = axes_flat[idx]
     col  = f"local_signed_{player}"
     _amax = gdf_train[col].abs().max()
-    gdf_train.plot(column=col, cmap="RdBu_r", legend=True,
+    gdf_train.plot(column=col, cmap="RdBu_r", legend=True, alpha=0.85,
                    markersize=30, ax=ax, vmin=-_amax, vmax=_amax)
+    add_basemap(ax)
     ax.set_title(player, fontsize=12)
-    ax.axis("equal"); ax.set_xlabel(""); ax.set_ylabel("")
+    ax.set_aspect("equal"); ax.set_axis_off()
 
 for idx in range(n_players, len(axes_flat)):
     axes_flat[idx].set_visible(False)
@@ -590,9 +676,10 @@ plt.tight_layout(); plt.show()
 
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(column="local_fidelity_r2", cmap="viridis", legend=True,
-               markersize=50, ax=ax, vmin=0, vmax=1)
+               markersize=50, alpha=0.85, ax=ax, vmin=0, vmax=1)
+add_basemap(ax)
 ax.set_title("Geo-SMILE: Local Surrogate Fidelity R² per Property", fontsize=14)
-ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
 
@@ -609,10 +696,11 @@ for player, color in color_map.items():
     subset = gdf_train[gdf_train["dominant_player"] == player]
     if len(subset):
         subset.plot(ax=ax, color=color, markersize=55, label=player, alpha=0.85)
+add_basemap(ax)
 
 ax.legend(title="Dominant Player", bbox_to_anchor=(1.01, 1), loc="upper left")
 ax.set_title("Geo-SMILE: Dominant Player Driver per Property", fontsize=15)
-ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
 
@@ -644,10 +732,11 @@ print(f"\nMost important player overall: {top_player}")
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(
     column=f"cell_signed_{top_player}", cmap="RdBu_r", legend=True,
-    markersize=50, ax=ax, vmin=-_ctop_abs_max, vmax=_ctop_abs_max
+    markersize=50, alpha=0.85, ax=ax, vmin=-_ctop_abs_max, vmax=_ctop_abs_max
 )
+add_basemap(ax)
 ax.set_title(f"Cell Importance Map: {top_player}", fontsize=15)
-ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
 
@@ -910,10 +999,14 @@ gdf_train["geo_imp_mean"] = geo_runs_df.mean(axis=1).reindex(gdf_train.index)
 gdf_train["geo_imp_std"]  = geo_runs_df.std(axis=1).reindex(gdf_train.index)
 
 fig, axes = plt.subplots(1, 2, figsize=(20, 8))
-gdf_train.plot(column="geo_imp_mean", cmap="plasma", legend=True, markersize=40, ax=axes[0])
-axes[0].set_title("Geo Score — Repeated-Run Mean", fontsize=13); axes[0].axis("equal")
-gdf_train.plot(column="geo_imp_std",  cmap="magma",  legend=True, markersize=40, ax=axes[1])
-axes[1].set_title("Geo Score — Instability (Std)",   fontsize=13); axes[1].axis("equal")
+gdf_train.plot(column="geo_imp_mean", cmap="plasma", legend=True, markersize=40, alpha=0.85, ax=axes[0])
+add_basemap(axes[0])
+axes[0].set_title("Geo Score — Repeated-Run Mean", fontsize=13)
+axes[0].set_aspect("equal"); axes[0].set_axis_off()
+gdf_train.plot(column="geo_imp_std",  cmap="magma",  legend=True, markersize=40, alpha=0.85, ax=axes[1])
+add_basemap(axes[1])
+axes[1].set_title("Geo Score — Instability (Std)",   fontsize=13)
+axes[1].set_aspect("equal"); axes[1].set_axis_off()
 plt.tight_layout(); plt.show()
 
 
@@ -928,9 +1021,10 @@ fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train[gdf_train["top10_geo"] == 0].plot(ax=ax, markersize=15, alpha=0.20, color="lightgrey")
 gdf_train[gdf_train["top10_geo"] == 1].plot(ax=ax, markersize=70, color="red",
                                              alpha=0.85, label="Top 10% Geo Score")
+add_basemap(ax)
 ax.legend()
 ax.set_title("Geo-SMILE: Top-10% High Distributional Geo Score Properties", fontsize=15)
-ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
 
