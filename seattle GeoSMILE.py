@@ -98,7 +98,7 @@ print("Testing samples :", X_test.shape[0])
 # ============================================================
 
 coords_scaler = StandardScaler()
-coords_train_scaled = coords_scaler.fit_transform(X_train[spatial_features])
+coords_train_scaled = coords_scaler.fit_transform(data.loc[X_train.index, spatial_features])
 
 n_groups = 100
 kmeans = KMeans(n_clusters=n_groups, random_state=42, n_init=10)
@@ -427,8 +427,10 @@ data_train["geo_importance_abs"] = geo_importance_abs
 data_train["geo_norm"]           = geo_norm
 
 for feat in features:
-    data_train[f"local_feat_{feat}"] = local_feat_imp_abs_df[feat]
-    data_train[f"cell_{feat}"]       = cell_df[feat]
+    data_train[f"local_feat_{feat}"]        = local_feat_imp_abs_df[feat]
+    data_train[f"local_feat_signed_{feat}"] = local_feat_imp_df[feat]
+    data_train[f"cell_{feat}"]              = cell_df[feat]
+    data_train[f"cell_signed_{feat}"]       = cell_df[feat] * np.sign(local_feat_imp_df[feat])
 
 data_train["dominant_feature"] = local_feat_imp_abs_df.idxmax(axis=1)
 
@@ -448,11 +450,15 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 16: Map — Geo Importance (Signed)
+# Step 16: Map — Signed Distributional Geo Importance (GeoSHAPLY Fig 10a style)
 # ============================================================
 
+_geo_abs_max = geo_importance.abs().max()
 fig, ax = plt.subplots(figsize=(12, 8))
-gdf_train.plot(column="geo_importance", cmap="Spectral", legend=True, markersize=50, ax=ax)
+gdf_train.plot(
+    column="geo_importance", cmap="RdBu_r", legend=True, markersize=50, ax=ax,
+    vmin=-_geo_abs_max, vmax=_geo_abs_max
+)
 ax.set_title("Geo-SMILE: Signed Distributional Geo Importance (Geo Branch)", fontsize=15)
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
 plt.tight_layout(); plt.show()
@@ -467,11 +473,28 @@ plt.tight_layout(); plt.show()
 # i.e. a truly per-point local geo importance, not a distributional one.
 # ============================================================
 
+_local_geo_abs_max = gdf_train["local_feat_signed_geo_dist"].abs().max()
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(
-    column="local_feat_geo_dist", cmap="plasma", legend=True, markersize=50, ax=ax
+    column="local_feat_signed_geo_dist", cmap="RdBu_r", legend=True, markersize=50, ax=ax,
+    vmin=-_local_geo_abs_max, vmax=_local_geo_abs_max
 )
-ax.set_title("Geo-SMILE: Local Geo Importance per Point (geo_dist feature)", fontsize=15)
+ax.set_title("Geo-SMILE: Local Geo Importance per Point (GeoSHAPLY Fig 10a style)", fontsize=15)
+ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+plt.tight_layout(); plt.show()
+
+# Figure 10b equivalent: signed cell map for the strongest interacting feature
+_strongest_cell_feat = cell_df.drop(columns=["geo_dist"]).mean(axis=0).idxmax()
+_cell_abs_max = gdf_train[f"cell_signed_{_strongest_cell_feat}"].abs().max()
+fig, ax = plt.subplots(figsize=(12, 8))
+gdf_train.plot(
+    column=f"cell_signed_{_strongest_cell_feat}", cmap="RdBu_r", legend=True,
+    markersize=50, ax=ax, vmin=-_cell_abs_max, vmax=_cell_abs_max
+)
+ax.set_title(
+    f"Geo-SMILE: {_strongest_cell_feat} × GEO Interaction (GeoSHAPLY Fig 10b style)",
+    fontsize=15
+)
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
 plt.tight_layout(); plt.show()
 
@@ -488,6 +511,41 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
+# Step 17b: Beeswarm Summary — GeoSHAPLY Figure 8 Style
+# ============================================================
+# Y-axis: features sorted by mean |local importance| (ascending).
+# X-axis: signed local importance for each training point.
+# Dot colour: standardised feature value (red=high, blue=low).
+# ============================================================
+
+_sorted_feats = feature_importance_abs.sort_values(ascending=True).index.tolist()
+
+fig, ax = plt.subplots(figsize=(12, max(6, len(_sorted_feats) * 0.55 + 1.5)))
+
+np.random.seed(0)
+for i, feat in enumerate(_sorted_feats):
+    imp_vals  = local_feat_imp_df[feat].values
+    raw_vals  = X_train[feat].values
+    feat_norm = (raw_vals - raw_vals.min()) / (raw_vals.max() - raw_vals.min() + 1e-12)
+    y_jitter  = i + np.random.uniform(-0.35, 0.35, size=len(imp_vals))
+    ax.scatter(imp_vals, y_jitter, c=feat_norm, cmap="RdBu_r",
+               alpha=0.55, s=10, vmin=0, vmax=1, linewidths=0)
+
+ax.set_yticks(range(len(_sorted_feats)))
+ax.set_yticklabels(_sorted_feats, fontsize=11)
+ax.axvline(0, color="black", lw=0.8, ls="--")
+ax.set_xlabel("GeoSMILE value (impact on model prediction)", fontsize=12)
+ax.set_title("Feature Contribution Ranking — GeoSHAPLY Fig 8 Style", fontsize=14)
+
+_sm = plt.cm.ScalarMappable(cmap="RdBu_r", norm=plt.Normalize(0, 1))
+_sm.set_array([])
+_cbar = fig.colorbar(_sm, ax=ax, pad=0.02, fraction=0.03)
+_cbar.set_label("Feature value", fontsize=10)
+_cbar.set_ticks([0, 1]); _cbar.set_ticklabels(["Low", "High"])
+plt.tight_layout(); plt.show()
+
+
+# ============================================================
 # Step 18: Maps — Local Feature Importance per Feature
 # ============================================================
 
@@ -499,12 +557,16 @@ axes_flat = axes.flatten()
 
 for idx, feat in enumerate(features):
     ax = axes_flat[idx]
+    col = f"local_feat_signed_{feat}"
+    _abs_max = gdf_train[col].abs().max()
     gdf_train.plot(
-        column=f"local_feat_{feat}",
-        cmap="YlOrRd",
+        column=col,
+        cmap="RdBu_r",
         legend=True,
         markersize=30,
-        ax=ax
+        ax=ax,
+        vmin=-_abs_max,
+        vmax=_abs_max,
     )
     ax.set_title(feat, fontsize=12)
     ax.axis("equal")
@@ -513,7 +575,7 @@ for idx, feat in enumerate(features):
 for idx in range(n_feats, len(axes_flat)):
     axes_flat[idx].set_visible(False)
 
-fig.suptitle("Local Feature Importance — Spatial Distribution", fontsize=16, y=1.01)
+fig.suptitle("Local Feature Importance — Signed Spatial Distribution (GeoSHAPLY Fig 9 Style)", fontsize=15, y=1.01)
 plt.tight_layout(); plt.show()
 
 
