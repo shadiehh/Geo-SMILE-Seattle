@@ -1,7 +1,7 @@
 # ============================================================
 # Geo-SMILE: Geo + Feature + Cell Explainability Pipeline
 # Extension of SMILE (Aslansefat) to spatial cases
-# Local explainer: feature importance computed per point
+# Local explainer: player importance computed per property
 # ============================================================
 
 # ============================================================
@@ -15,7 +15,6 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import seaborn as sns
 
 from tqdm import tqdm
@@ -49,34 +48,27 @@ data = pd.read_csv(
 spatial_features = ["UTM_X", "UTM_Y"]
 target = "log_price"
 
-# geo_dist replaces separate UTM_X / UTM_Y in the model: a single scalar
-# (standardised Euclidean distance from the dataset centroid) that encodes
-# spatial location as a first-class feature.  This lets the feature branch
-# produce a truly local per-point geo importance for each property —
-# consistent with the Chicago dataset where UTM_X + UTM_Y were combined into
-# one composite geo feature.
+# All model features. UTM_X and UTM_Y enter the model as separate coordinates;
+# they are treated as ONE joint "location" player during SMILE explanation
+# (matching the Chicago design: location = [x_coord, y_coord] as a joint player).
 features = [
     "bathrooms", "sqft_living", "sqft_lot", "grade",
     "condition", "waterfront", "view", "age",
-    "geo_dist"
+    "UTM_X", "UTM_Y"
 ]
 
-required_cols = spatial_features + [f for f in features if f != "geo_dist"] + [target]
-missing_cols = [c for c in required_cols if c not in data.columns]
+# SMILE players: non-spatial features are individual players;
+# UTM_X + UTM_Y form a single joint "location" player.
+non_spatial_feats = [f for f in features if f not in spatial_features]
+players   = non_spatial_feats + ["location"]
+n_players = len(players)
+
+required_cols = features + [target]
+missing_cols  = [c for c in required_cols if c not in data.columns]
 if missing_cols:
     raise ValueError(f"Missing columns: {missing_cols}")
 
 data = data.dropna(subset=required_cols).reset_index(drop=True)
-
-# Build geo_dist from all rows (centroid computed on full dataset).
-# UTM_X and UTM_Y are retained in `data` for KMeans (Step 3) and mapping.
-_cx = data["UTM_X"].mean()
-_cy = data["UTM_Y"].mean()
-_sc = np.sqrt(data["UTM_X"].var() + data["UTM_Y"].var())
-data["geo_dist"] = (
-    np.sqrt((data["UTM_X"] - _cx) ** 2 + (data["UTM_Y"] - _cy) ** 2) / (_sc + 1e-12)
-)
-
 X = data[features].copy()
 y = data[target].copy()
 
@@ -92,20 +84,22 @@ X_train, X_test, y_train, y_test = train_test_split(
 print("Training samples:", X_train.shape[0])
 print("Testing samples :", X_test.shape[0])
 
+# baseline_values derived from training data only — no leakage
+baseline_values = X_train.median()
+
 
 # ============================================================
 # Step 3: Spatial Groups via KMeans (Geo branch)
 # ============================================================
 
-coords_scaler = StandardScaler()
+coords_scaler       = StandardScaler()
 coords_train_scaled = coords_scaler.fit_transform(data.loc[X_train.index, spatial_features])
 
 n_groups = 100
-kmeans = KMeans(n_clusters=n_groups, random_state=42, n_init=10)
+kmeans   = KMeans(n_clusters=n_groups, random_state=42, n_init=10)
 spatial_group_labels = kmeans.fit_predict(coords_train_scaled)
 
 print(f"\nSpatial groups: {n_groups}")
-print("Group size summary:")
 print(pd.Series(spatial_group_labels).value_counts().describe())
 
 
@@ -114,24 +108,14 @@ print(pd.Series(spatial_group_labels).value_counts().describe())
 # ============================================================
 
 automl = AutoML()
-automl.fit(
-    X_train, y_train,
-    task="regression",
-    time_budget=20,
-    metric="r2",
-    verbose=0
-)
+automl.fit(X_train, y_train, task="regression", time_budget=20, metric="r2", verbose=0)
 
-train_preds = automl.predict(X_train)
-test_preds  = automl.predict(X_test)
+train_preds   = automl.predict(X_train)
+test_preds    = automl.predict(X_test)
+original_preds = train_preds.copy()
 
-base_train_r2 = r2_score(y_train, train_preds)
-base_test_r2  = r2_score(y_test,  test_preds)
-
-print(f"\nBlack-box — Train R2: {base_train_r2:.4f} | Test R2: {base_test_r2:.4f}")
-
-original_preds  = train_preds.copy()
-baseline_values = X_train.median()
+print(f"\nBlack-box — Train R2: {r2_score(y_train, train_preds):.4f} | "
+      f"Test R2: {r2_score(y_test, test_preds):.4f}")
 
 
 # ============================================================
@@ -158,24 +142,35 @@ def apply_kernel(distances, kernel_type, sigma=None):
     raise ValueError(f"Unknown kernel: {kernel_type}")
 
 
-def select_best_kernel(M_tr, M_te, input_dist_tr, response_tr, response_te):
+def select_best_kernel(M_tr, M_va, input_dist_tr, response_tr, response_va):
     """
-    input_dist_tr : input-space distances -> locality weights (SMILE: perturbation distance)
-    response_tr/te: output-space shifts   -> surrogate target (SMILE: prediction difference)
-    Keeping these quantities separate is required by the SMILE locality principle.
+    Kernel selected on validation set only; caller reports fidelity on a
+    separate test set so there is no selection bias in the final metric.
+    input_dist_tr : input-space distances  → locality weights
+    response_tr/va: output-space shifts    → surrogate target
     """
     results = {}
     for k in KERNELS:
         w = np.clip(apply_kernel(input_dist_tr, k), 1e-8, None)
         ridge = Ridge(alpha=1.0)
         ridge.fit(M_tr, response_tr, sample_weight=w)
-        results[k] = r2_score(response_te, ridge.predict(M_te))
+        results[k] = r2_score(response_va, ridge.predict(M_va))
     best = max(results, key=results.get)
     return best, results
 
 
 # ============================================================
-# Step 6: Geo Perturbations (S sets, spatial group masking)
+# Step 6: Geo Perturbations — Group-Level Mask
+# ============================================================
+# M_geo ∈ {0,1}^(S×G): each column is one KMeans spatial group.
+# Group-level mask ensures each group has its own identifiable Ridge
+# coefficient (properties within the same cluster always share the
+# same column, so using n_points columns would be non-identifiable).
+#
+# ONLY the spatial coordinates (UTM_X, UTM_Y) are neutralised for
+# properties in selected groups; all other features remain at their
+# real observed values. This isolates the geographic contribution
+# rather than measuring complete-profile replacement sensitivity.
 # ============================================================
 
 n_points   = X_train.shape[0]
@@ -183,7 +178,7 @@ n_subsets  = 3000
 min_groups = 5
 max_groups = 10
 
-M_geo        = np.zeros((n_subsets, n_points), dtype=np.int8)
+M_geo        = np.zeros((n_subsets, n_groups), dtype=np.int8)
 y_shifts_geo = []
 
 for j in tqdm(range(n_subsets), desc="Geo perturbations"):
@@ -196,41 +191,40 @@ for j in tqdm(range(n_subsets), desc="Geo perturbations"):
         continue
 
     X_pert = X_train.copy()
-    X_pert.iloc[idx] = baseline_values.values
+    X_pert.loc[X_train.index[idx], spatial_features] = baseline_values[spatial_features].values
     pert_preds = automl.predict(X_pert)
     y_shifts_geo.append(wasserstein_distance(original_preds[idx], pert_preds[idx]))
-    M_geo[j, idx] = 1
+    M_geo[j, sel] = 1
 
 y_shifts_geo = np.array(y_shifts_geo)
 print(f"\nGeo shifts — mean: {y_shifts_geo.mean():.4f}, std: {y_shifts_geo.std():.4f}")
 
 
 # ============================================================
-# Step 7: Kernel Selection — Geo Branch
+# Step 7: Kernel Selection — Geo Branch (3-way split)
 # ============================================================
-# Input distance = proportion of training points perturbed.
-# This measures how far each perturbation is from the original
-# spatial configuration in INPUT space, independently of the
-# Wasserstein shift (the OUTPUT response).
+# geo_input_dist = proportion of spatial GROUPS selected per perturbation
+# (not proportion of points — the group is the perturbation unit).
+# Three-way split: kernel chosen on validation, fidelity on test.
 # ============================================================
 
-# Proportion of training points neutralised in each perturbation
-geo_input_dist = M_geo.sum(axis=1).astype(float) / n_points
+geo_input_dist = M_geo.sum(axis=1).astype(float) / n_groups
 
-M_geo_tr, M_geo_te, sg_tr, sg_te, gid_tr, gid_te = train_test_split(
-    M_geo, y_shifts_geo, geo_input_dist, test_size=0.25, random_state=42
-)
+all_geo_idx  = np.arange(n_subsets)
+geo_tr_idx, geo_tmp_idx = train_test_split(all_geo_idx, test_size=0.40, random_state=42)
+geo_va_idx, geo_te_idx  = train_test_split(geo_tmp_idx, test_size=0.50, random_state=42)
+
+M_geo_tr  = M_geo[geo_tr_idx];  M_geo_va  = M_geo[geo_va_idx];  M_geo_te  = M_geo[geo_te_idx]
+sg_tr     = y_shifts_geo[geo_tr_idx]; sg_va = y_shifts_geo[geo_va_idx]; sg_te = y_shifts_geo[geo_te_idx]
+gid_tr    = geo_input_dist[geo_tr_idx]; gid_va = geo_input_dist[geo_va_idx]
 
 best_k_geo, k_scores_geo = select_best_kernel(
-    M_geo_tr, M_geo_te,
-    gid_tr,           # INPUT distance -> weight
-    sg_tr, sg_te      # OUTPUT Wasserstein shift -> response
+    M_geo_tr, M_geo_va, gid_tr, sg_tr, sg_va
 )
 
-print("\nKernel R2 — Geo branch:")
+print("\nKernel R2 — Geo branch (validation set):")
 for k, v in sorted(k_scores_geo.items(), key=lambda x: -x[1]):
-    marker = " <- best" if k == best_k_geo else ""
-    print(f"  {k:<14} {v:.4f}{marker}")
+    print(f"  {k:<14} {v:.4f}{' <- best' if k == best_k_geo else ''}")
 
 geo_w_tr = np.clip(apply_kernel(gid_tr, best_k_geo), 1e-8, None)
 
@@ -238,9 +232,14 @@ geo_w_tr = np.clip(apply_kernel(gid_tr, best_k_geo), 1e-8, None)
 # ============================================================
 # Step 8: Weighted Ridge Surrogate — Geo Branch
 # ============================================================
+# n_groups coefficients, one per spatial cluster.
+# Each training property is assigned its cluster's coefficient →
+# "property-indexed distributional geo score" (not a locally fitted value).
+# Fidelity reported on the held-out test set.
+# ============================================================
 
 ridge_geo = Ridge(alpha=1.0)
-ridge_geo.fit(M_geo_tr, sg_tr, sample_weight=geo_w_tr)  # weight=INPUT dist, response=OUTPUT Wasserstein
+ridge_geo.fit(M_geo_tr, sg_tr, sample_weight=geo_w_tr)
 
 pred_geo_tr = ridge_geo.predict(M_geo_tr)
 pred_geo_te = ridge_geo.predict(M_geo_te)
@@ -252,39 +251,48 @@ geo_fidelity = {
     "L1":          mean_absolute_error(sg_te, pred_geo_te),
     "L2":          np.sqrt(mean_squared_error(sg_te, pred_geo_te)),
 }
-
-print(f"\nGeo surrogate fidelity (kernel={best_k_geo}):")
+print(f"\nGeo surrogate fidelity (kernel={best_k_geo}, test set):")
 for k, v in geo_fidelity.items():
     print(f"  {k}: {v:.6f}")
 
-geo_importance     = pd.Series(ridge_geo.coef_, index=X_train.index, name="geo_importance")
+geo_group_importance = ridge_geo.coef_                   # shape (n_groups,)
+geo_importance = pd.Series(
+    geo_group_importance[spatial_group_labels],          # map group → property
+    index=X_train.index,
+    name="geo_importance"
+)
 geo_importance_abs = geo_importance.abs()
 
 
 # ============================================================
-# Step 9: Feature Perturbations
+# Step 9: Feature Perturbations — Player-Based Masking
 # ============================================================
-# K random binary masks over features.
-# For each perturbation, store the full prediction vector so
-# that local per-point feature importance can be computed
-# without extra model calls in Step 12.
+# Players: non-spatial features individual; UTM_X+UTM_Y as "location" player.
+# Sign convention (z_k = 1 → player k REMOVED, consistent with Chicago):
+#   removal[k] = 1 → player k neutralised to baseline
+#   removal[k] = 0 → player k at real value
+# Response: r_ik = f(x_i) - f(x_i^(k))   (original minus perturbed).
+#   Positive Ridge coefficient → removing this player tends to lower the
+#   predicted price → the player contributes positively at this property.
 # ============================================================
 
-n_feats = len(features)
-K_feat  = 3000
+K_feat = 3000
 
-M_feat               = np.zeros((K_feat, n_feats),  dtype=np.int8)
-all_pert_preds_feat  = np.zeros((K_feat, n_points), dtype=np.float32)
+M_feat               = np.zeros((K_feat, n_players), dtype=np.int8)
+all_pert_preds_feat  = np.zeros((K_feat, n_points),  dtype=np.float32)
 y_shifts_feat        = []
 
 for j in tqdm(range(K_feat), desc="Feature perturbations"):
-    mask = np.random.randint(0, 2, size=n_feats)
-    M_feat[j] = mask
+    removal = np.random.randint(0, 2, size=n_players)   # 1 = removed
+    M_feat[j] = removal
 
     X_pert = X_train.copy()
-    for ki, feat in enumerate(features):
-        if mask[ki] == 0:
-            X_pert[feat] = baseline_values[feat]
+    for ki, player in enumerate(players):
+        if removal[ki] == 1:
+            if player == "location":
+                X_pert[spatial_features] = baseline_values[spatial_features].values
+            else:
+                X_pert[player] = baseline_values[player]
 
     pert_preds = automl.predict(X_pert)
     all_pert_preds_feat[j] = pert_preds
@@ -295,47 +303,41 @@ print(f"\nFeature shifts — mean: {y_shifts_feat.mean():.4f}, std: {y_shifts_fe
 
 
 # ============================================================
-# Step 10: Kernel Selection — Feature Branch
+# Step 10: Kernel Selection — Feature Branch (3-way split)
 # ============================================================
-# Input distance = normalised Hamming distance = proportion of
-# features masked to baseline in each perturbation.
-# This is computed from M_feat (INPUT space) independently of
-# the Wasserstein shift (OUTPUT space), fixing the circularity
-# present when the same quantity is used for both weight and
-# response.
+# Hamming distance = proportion of players REMOVED per perturbation.
 # ============================================================
 
-# Proportion of features masked in each perturbation (input distance)
-feat_hamming_dist = (M_feat == 0).sum(axis=1).astype(float) / n_feats
+feat_hamming_dist = M_feat.sum(axis=1).astype(float) / n_players
 
-M_feat_tr, M_feat_te, sf_tr, sf_te, fhd_tr, fhd_te = train_test_split(
-    M_feat, y_shifts_feat, feat_hamming_dist, test_size=0.25, random_state=42
-)
+all_feat_idx = np.arange(K_feat)
+feat_tr_idx, feat_tmp_idx = train_test_split(all_feat_idx, test_size=0.40, random_state=42)
+feat_va_idx, feat_te_idx  = train_test_split(feat_tmp_idx, test_size=0.50, random_state=42)
+
+M_feat_tr = M_feat[feat_tr_idx]; M_feat_va = M_feat[feat_va_idx]; M_feat_te = M_feat[feat_te_idx]
+sf_tr  = y_shifts_feat[feat_tr_idx]; sf_va = y_shifts_feat[feat_va_idx]; sf_te = y_shifts_feat[feat_te_idx]
+fhd_tr = feat_hamming_dist[feat_tr_idx]; fhd_va = feat_hamming_dist[feat_va_idx]
 
 best_k_feat, k_scores_feat = select_best_kernel(
-    M_feat_tr, M_feat_te,
-    fhd_tr,           # INPUT Hamming distance -> weight
-    sf_tr, sf_te      # OUTPUT Wasserstein shift -> response
+    M_feat_tr, M_feat_va, fhd_tr, sf_tr, sf_va
 )
 
-print("\nKernel R2 — Feature branch:")
+print("\nKernel R2 — Feature branch (validation set):")
 for k, v in sorted(k_scores_feat.items(), key=lambda x: -x[1]):
-    marker = " <- best" if k == best_k_feat else ""
-    print(f"  {k:<14} {v:.4f}{marker}")
+    print(f"  {k:<14} {v:.4f}{' <- best' if k == best_k_feat else ''}")
 
 feat_w_tr = np.clip(apply_kernel(fhd_tr, best_k_feat), 1e-8, None)
 
 
 # ============================================================
-# Step 11: Global Weighted Ridge — Feature Branch (fidelity)
+# Step 11: Global Weighted Ridge — Feature Branch (distributional fidelity)
 # ============================================================
-# A single global surrogate is kept solely to report fidelity
-# metrics comparable to the Geo branch. The actual feature
-# importance used for explanation comes from Step 12 (local).
+# Kept for Wasserstein-level fidelity comparison with the geo branch.
+# Fidelity reported on the held-out test set (not the validation set).
 # ============================================================
 
 ridge_feat_global = Ridge(alpha=1.0)
-ridge_feat_global.fit(M_feat_tr, sf_tr, sample_weight=feat_w_tr)  # weight=INPUT Hamming, response=OUTPUT Wasserstein
+ridge_feat_global.fit(M_feat_tr, sf_tr, sample_weight=feat_w_tr)
 
 pred_feat_tr = ridge_feat_global.predict(M_feat_tr)
 pred_feat_te = ridge_feat_global.predict(M_feat_te)
@@ -347,57 +349,59 @@ feat_fidelity = {
     "L1":          mean_absolute_error(sf_te, pred_feat_te),
     "L2":          np.sqrt(mean_squared_error(sf_te, pred_feat_te)),
 }
-
-print(f"\nFeature surrogate fidelity (kernel={best_k_feat}):")
+print(f"\nGlobal feature surrogate fidelity (kernel={best_k_feat}, test set):")
 for k, v in feat_fidelity.items():
     print(f"  {k}: {v:.6f}")
 
 
 # ============================================================
-# Step 12: Local Feature Importance per Point
+# Step 12: Local Player Importance per Property + Local Fidelity
 # ============================================================
-# For each training point i:
-#   y_i[j] = predicted_preds[j][i] - original_preds[i]
-#          = how much perturbation j changed THIS point's output
-#   w_i[j] = kernel(|y_i[j]|)
-#          = weight by local prediction sensitivity
-#   Ridge(M_feat, y_i, w_i) -> coef_ = local feature importance for i
-#
-# Result: local_feat_imp_df  shape (n_points x n_features)
+# For each training property i, a separate Ridge is fitted using
+# TRAINING perturbations only, then evaluated on TEST perturbations.
+# Response: r_ik = f(x_i) - f(x_i^(k))   (original minus perturbed).
+# Locality weights from INPUT Hamming distance of training perturbations.
+# Local fidelity: per-property R² on the held-out test perturbations.
 # ============================================================
 
-local_feat_imp = np.zeros((n_points, n_feats), dtype=np.float32)
+local_feat_imp   = np.zeros((n_points, n_players), dtype=np.float32)
+local_r2_scores  = np.zeros(n_points, dtype=np.float32)
 
-# Locality weights from INPUT Hamming distance — identical for every point.
-# Only the response y_i (prediction change at point i) varies per point.
-# This properly separates: INPUT distance -> weight, OUTPUT change -> response.
-local_weights = np.clip(apply_kernel(feat_hamming_dist, best_k_feat), 1e-8, None)
+local_weights_tr = np.clip(apply_kernel(fhd_tr, best_k_feat), 1e-8, None)
 
-for i in tqdm(range(n_points), desc="Local feature importance per point"):
-    y_i = all_pert_preds_feat[:, i] - original_preds[i]   # OUTPUT response for point i
+for i in tqdm(range(n_points), desc="Local player importance per property"):
+    y_i_tr = original_preds[i] - all_pert_preds_feat[feat_tr_idx, i]  # original − perturbed
+    y_i_te = original_preds[i] - all_pert_preds_feat[feat_te_idx, i]
 
     ridge_i = Ridge(alpha=1.0)
-    ridge_i.fit(M_feat, y_i, sample_weight=local_weights)  # INPUT weight, OUTPUT response
-    local_feat_imp[i] = ridge_i.coef_
+    ridge_i.fit(M_feat_tr, y_i_tr, sample_weight=local_weights_tr)
+    local_feat_imp[i]  = ridge_i.coef_
+    local_r2_scores[i] = r2_score(y_i_te, ridge_i.predict(M_feat_te))
 
-local_feat_imp_df     = pd.DataFrame(local_feat_imp,     index=X_train.index, columns=features)
-local_feat_imp_abs_df = pd.DataFrame(np.abs(local_feat_imp), index=X_train.index, columns=features)
+local_feat_imp_df     = pd.DataFrame(local_feat_imp,          index=X_train.index, columns=players)
+local_feat_imp_abs_df = pd.DataFrame(np.abs(local_feat_imp),  index=X_train.index, columns=players)
+local_r2_series       = pd.Series(local_r2_scores, index=X_train.index)
 
-# Global summary = mean local importance across all points
 feature_importance     = local_feat_imp_df.mean(axis=0)
 feature_importance_abs = local_feat_imp_abs_df.mean(axis=0)
 
-print("\nGlobal feature importance (mean of local):")
+print("\nGlobal player importance (mean of local):")
 display(feature_importance_abs.sort_values(ascending=False).to_frame("mean_local_importance"))
+
+print(f"\nLocal fidelity (per-property R² on held-out test perturbations):")
+print(f"  Median : {np.median(local_r2_scores):.4f}")
+print(f"  Mean   : {local_r2_scores.mean():.4f}  Std: {local_r2_scores.std():.4f}")
+print(f"  IQR    : {np.percentile(local_r2_scores,25):.4f} – "
+      f"{np.percentile(local_r2_scores,75):.4f}")
+print(f"  Prop > 0.50 R²: {(local_r2_scores > 0.50).mean():.2%}")
 
 
 # ============================================================
 # Step 13: Cell Explainability
 # ============================================================
-# geo_norm[i]           — how geographically important is point i
-# local_feat_norm[i, j] — how important is feature j at point i
-# cell[i, j] = geo_norm[i] * local_feat_norm[i, j]
-# Both dimensions vary spatially.
+# geo_norm[i]           — property-indexed distributional geo score [0,1]
+# local_feat_norm[i, j] — local player importance at property i [0,1]
+# cell[i, j]            = geo_norm[i] × local_feat_norm[i, j]
 # ============================================================
 
 _eps = 1e-12
@@ -405,14 +409,13 @@ _eps = 1e-12
 geo_norm = (geo_importance_abs - geo_importance_abs.min()) / \
            (geo_importance_abs.max() - geo_importance_abs.min() + _eps)
 
-# Normalize local feature importance per feature column to [0, 1]
 feat_col_min = local_feat_imp_abs_df.min(axis=0)
 feat_col_max = local_feat_imp_abs_df.max(axis=0)
 local_feat_norm = (local_feat_imp_abs_df - feat_col_min) / \
                   (feat_col_max - feat_col_min + _eps)
 
 cell_matrix = geo_norm.values[:, np.newaxis] * local_feat_norm.values
-cell_df     = pd.DataFrame(cell_matrix, index=geo_norm.index, columns=features)
+cell_df     = pd.DataFrame(cell_matrix, index=geo_norm.index, columns=players)
 
 print("\nCell importance matrix shape:", cell_df.shape)
 
@@ -425,32 +428,38 @@ data_train = data.loc[X_train.index].copy()
 data_train["geo_importance"]     = geo_importance
 data_train["geo_importance_abs"] = geo_importance_abs
 data_train["geo_norm"]           = geo_norm
+data_train["local_fidelity_r2"]  = local_r2_series
 
-for feat in features:
-    data_train[f"local_feat_{feat}"]        = local_feat_imp_abs_df[feat]
-    data_train[f"local_feat_signed_{feat}"] = local_feat_imp_df[feat]
-    data_train[f"cell_{feat}"]              = cell_df[feat]
-    data_train[f"cell_signed_{feat}"]       = cell_df[feat] * np.sign(local_feat_imp_df[feat])
+for player in players:
+    data_train[f"local_{player}"]        = local_feat_imp_abs_df[player]
+    data_train[f"local_signed_{player}"] = local_feat_imp_df[player]
+    data_train[f"cell_{player}"]         = cell_df[player]
+    data_train[f"cell_signed_{player}"]  = cell_df[player] * np.sign(local_feat_imp_df[player])
 
-data_train["dominant_feature"] = local_feat_imp_abs_df.idxmax(axis=1)
+data_train["dominant_player"] = local_feat_imp_abs_df.idxmax(axis=1)
 
 data_train["geometry"] = gpd.points_from_xy(data_train["UTM_X"], data_train["UTM_Y"])
 gdf_train = gpd.GeoDataFrame(data_train, geometry="geometry", crs="EPSG:32610")
 
 
 # ============================================================
-# Step 15: Map — Geo Importance (Absolute)
+# Step 15: Map — Distributional Geo Score (Absolute)
+# ============================================================
+# Each property displays the importance score of its spatial cluster.
+# The score measures each cluster's contribution to Wasserstein shift
+# when ONLY the spatial coordinates are neutralised.
+# This is a property-indexed cluster score, NOT a locally fitted value.
 # ============================================================
 
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(column="geo_importance_abs", cmap="plasma", legend=True, markersize=50, ax=ax)
-ax.set_title("Geo-SMILE: Distributional Geo Importance (Geo Branch)", fontsize=15)
+ax.set_title("Geo-SMILE: Property-Indexed Distributional Geo Score (|Cluster|)", fontsize=14)
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 16: Map — Signed Distributional Geo Importance (GeoSHAPLY Fig 10a style)
+# Step 16: Map — Signed Distributional Geo Score (GeoSHAPLY Fig 10a style)
 # ============================================================
 
 _geo_abs_max = geo_importance.abs().max()
@@ -459,53 +468,54 @@ gdf_train.plot(
     column="geo_importance", cmap="RdBu_r", legend=True, markersize=50, ax=ax,
     vmin=-_geo_abs_max, vmax=_geo_abs_max
 )
-ax.set_title("Geo-SMILE: Signed Distributional Geo Importance (Geo Branch)", fontsize=15)
+ax.set_title("Geo-SMILE: Signed Distributional Geo Score (GeoSHAPLY Fig 10a Style)", fontsize=14)
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 16b: Map — Local Geo Importance per Point (geo_dist)
+# Step 16b: Map — Local Location Player Importance (GeoSHAPLY Fig 10a equivalent)
 # ============================================================
-# geo_dist is a first-class feature in the feature branch.
-# Its local importance at each point i = how much that property's
-# predicted price changes when its distance-from-centroid is masked —
-# i.e. a truly per-point local geo importance, not a distributional one.
+# "location" player = joint UTM_X + UTM_Y treated as one SMILE player.
+# Its importance at property i is the Ridge coefficient from the LOCAL
+# surrogate fitted separately for each property (truly locally fitted,
+# unlike the cluster score in Step 15/16).
 # ============================================================
 
-_local_geo_abs_max = gdf_train["local_feat_signed_geo_dist"].abs().max()
+_loc_abs_max = gdf_train["local_signed_location"].abs().max()
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(
-    column="local_feat_signed_geo_dist", cmap="RdBu_r", legend=True, markersize=50, ax=ax,
-    vmin=-_local_geo_abs_max, vmax=_local_geo_abs_max
+    column="local_signed_location", cmap="RdBu_r", legend=True, markersize=50, ax=ax,
+    vmin=-_loc_abs_max, vmax=_loc_abs_max
 )
-ax.set_title("Geo-SMILE: Local Geo Importance per Point (GeoSHAPLY Fig 10a style)", fontsize=15)
+ax.set_title("Geo-SMILE: Local Location Player Importance per Property (GeoSHAPLY Fig 10a)", fontsize=14)
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
 plt.tight_layout(); plt.show()
 
-# Figure 10b equivalent: signed cell map for the strongest interacting feature
-_strongest_cell_feat = cell_df.drop(columns=["geo_dist"]).mean(axis=0).idxmax()
-_cell_abs_max = gdf_train[f"cell_signed_{_strongest_cell_feat}"].abs().max()
+# Fig 10b equivalent: signed cell map for strongest non-location interacting player
+_non_loc = [p for p in players if p != "location"]
+_strongest_cell = cell_df[_non_loc].mean(axis=0).idxmax()
+_cell_abs_max   = gdf_train[f"cell_signed_{_strongest_cell}"].abs().max()
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(
-    column=f"cell_signed_{_strongest_cell_feat}", cmap="RdBu_r", legend=True,
+    column=f"cell_signed_{_strongest_cell}", cmap="RdBu_r", legend=True,
     markersize=50, ax=ax, vmin=-_cell_abs_max, vmax=_cell_abs_max
 )
 ax.set_title(
-    f"Geo-SMILE: {_strongest_cell_feat} × GEO Interaction (GeoSHAPLY Fig 10b style)",
-    fontsize=15
+    f"Geo-SMILE: {_strongest_cell} × Location Interaction (GeoSHAPLY Fig 10b Style)",
+    fontsize=14
 )
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 17: Bar Chart — Global Feature Importance (mean local)
+# Step 17: Bar Chart — Global Player Importance (mean local)
 # ============================================================
 
 fig, ax = plt.subplots(figsize=(10, 5))
 feature_importance_abs.sort_values().plot(kind="barh", ax=ax, color="steelblue")
-ax.set_title("Geo-SMILE: Global Feature Importance (mean of local)", fontsize=14)
+ax.set_title("Geo-SMILE: Global Player Importance (mean of local)", fontsize=14)
 ax.set_xlabel("Mean Local Importance Score")
 plt.tight_layout(); plt.show()
 
@@ -513,29 +523,29 @@ plt.tight_layout(); plt.show()
 # ============================================================
 # Step 17b: Beeswarm Summary — GeoSHAPLY Figure 8 Style
 # ============================================================
-# Y-axis: features sorted by mean |local importance| (ascending).
-# X-axis: signed local importance for each training point.
-# Dot colour: standardised feature value (red=high, blue=low).
+# Y-axis: players sorted by mean |local importance| (ascending).
+# X-axis: signed local importance value for each training property.
+# Dot colour: standardised player value (red=high, blue=low).
+# For the "location" player, UTM_X is used as the colour proxy.
 # ============================================================
 
-_sorted_feats = feature_importance_abs.sort_values(ascending=True).index.tolist()
-
-fig, ax = plt.subplots(figsize=(12, max(6, len(_sorted_feats) * 0.55 + 1.5)))
+_sorted_players = feature_importance_abs.sort_values(ascending=True).index.tolist()
+fig, ax = plt.subplots(figsize=(12, max(6, len(_sorted_players) * 0.55 + 1.5)))
 
 np.random.seed(0)
-for i, feat in enumerate(_sorted_feats):
-    imp_vals  = local_feat_imp_df[feat].values
-    raw_vals  = X_train[feat].values
+for i, player in enumerate(_sorted_players):
+    imp_vals  = local_feat_imp_df[player].values
+    raw_vals  = X_train["UTM_X"].values if player == "location" else X_train[player].values
     feat_norm = (raw_vals - raw_vals.min()) / (raw_vals.max() - raw_vals.min() + 1e-12)
     y_jitter  = i + np.random.uniform(-0.35, 0.35, size=len(imp_vals))
     ax.scatter(imp_vals, y_jitter, c=feat_norm, cmap="RdBu_r",
                alpha=0.55, s=10, vmin=0, vmax=1, linewidths=0)
 
-ax.set_yticks(range(len(_sorted_feats)))
-ax.set_yticklabels(_sorted_feats, fontsize=11)
+ax.set_yticks(range(len(_sorted_players)))
+ax.set_yticklabels(_sorted_players, fontsize=11)
 ax.axvline(0, color="black", lw=0.8, ls="--")
 ax.set_xlabel("GeoSMILE value (impact on model prediction)", fontsize=12)
-ax.set_title("Feature Contribution Ranking — GeoSHAPLY Fig 8 Style", fontsize=14)
+ax.set_title("Player Contribution Ranking — GeoSHAPLY Fig 8 Style", fontsize=14)
 
 _sm = plt.cm.ScalarMappable(cmap="RdBu_r", norm=plt.Normalize(0, 1))
 _sm.set_array([])
@@ -546,91 +556,97 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 18: Maps — Local Feature Importance per Feature
+# Step 18: Maps — Local Player Importance (GeoSHAPLY Fig 9 Style)
 # ============================================================
 
 ncols = 3
-nrows = int(np.ceil(n_feats / ncols))
+nrows = int(np.ceil(n_players / ncols))
 
 fig, axes = plt.subplots(nrows, ncols, figsize=(18, nrows * 5))
 axes_flat = axes.flatten()
 
-for idx, feat in enumerate(features):
-    ax = axes_flat[idx]
-    col = f"local_feat_signed_{feat}"
-    _abs_max = gdf_train[col].abs().max()
-    gdf_train.plot(
-        column=col,
-        cmap="RdBu_r",
-        legend=True,
-        markersize=30,
-        ax=ax,
-        vmin=-_abs_max,
-        vmax=_abs_max,
-    )
-    ax.set_title(feat, fontsize=12)
-    ax.axis("equal")
-    ax.set_xlabel(""); ax.set_ylabel("")
+for idx, player in enumerate(players):
+    ax   = axes_flat[idx]
+    col  = f"local_signed_{player}"
+    _amax = gdf_train[col].abs().max()
+    gdf_train.plot(column=col, cmap="RdBu_r", legend=True,
+                   markersize=30, ax=ax, vmin=-_amax, vmax=_amax)
+    ax.set_title(player, fontsize=12)
+    ax.axis("equal"); ax.set_xlabel(""); ax.set_ylabel("")
 
-for idx in range(n_feats, len(axes_flat)):
+for idx in range(n_players, len(axes_flat)):
     axes_flat[idx].set_visible(False)
 
-fig.suptitle("Local Feature Importance — Signed Spatial Distribution (GeoSHAPLY Fig 9 Style)", fontsize=15, y=1.01)
+fig.suptitle(
+    "Local Player Importance — Signed Spatial Distribution (GeoSHAPLY Fig 9 Style)",
+    fontsize=15, y=1.01
+)
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 19: Map — Dominant Feature per Point
+# Step 18b: Map — Local Surrogate Fidelity per Property
 # ============================================================
 
-unique_feats = list(local_feat_imp_abs_df.idxmax(axis=1).unique())
-palette      = plt.cm.get_cmap("tab10", len(unique_feats))
-color_map    = {f: palette(i) for i, f in enumerate(unique_feats)}
-
-fig, ax = plt.subplots(figsize=(13, 9))
-
-for feat, color in color_map.items():
-    subset = gdf_train[gdf_train["dominant_feature"] == feat]
-    if len(subset) > 0:
-        subset.plot(ax=ax, color=color, markersize=55, label=feat, alpha=0.85)
-
-ax.legend(title="Dominant Feature", bbox_to_anchor=(1.01, 1), loc="upper left")
-ax.set_title("Geo-SMILE: Dominant Feature Driver per Point", fontsize=15)
+fig, ax = plt.subplots(figsize=(12, 8))
+gdf_train.plot(column="local_fidelity_r2", cmap="viridis", legend=True,
+               markersize=50, ax=ax, vmin=0, vmax=1)
+ax.set_title("Geo-SMILE: Local Surrogate Fidelity R² per Property", fontsize=14)
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 20: Heatmap — Cell Explainability (Top-30 Points)
+# Step 19: Map — Dominant Player per Property
+# ============================================================
+
+unique_players = list(local_feat_imp_abs_df.idxmax(axis=1).unique())
+palette        = plt.cm.get_cmap("tab10", len(unique_players))
+color_map      = {p: palette(i) for i, p in enumerate(unique_players)}
+
+fig, ax = plt.subplots(figsize=(13, 9))
+for player, color in color_map.items():
+    subset = gdf_train[gdf_train["dominant_player"] == player]
+    if len(subset):
+        subset.plot(ax=ax, color=color, markersize=55, label=player, alpha=0.85)
+
+ax.legend(title="Dominant Player", bbox_to_anchor=(1.01, 1), loc="upper left")
+ax.set_title("Geo-SMILE: Dominant Player Driver per Property", fontsize=15)
+ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+plt.tight_layout(); plt.show()
+
+
+# ============================================================
+# Step 20: Heatmap — Cell Explainability (Top-30 Properties)
 # ============================================================
 
 top30_idx = geo_importance_abs.nlargest(30).index
 
 fig, ax = plt.subplots(figsize=(14, 8))
 sns.heatmap(
-    cell_df.loc[top30_idx],
-    cmap="YlOrRd",
-    ax=ax,
-    xticklabels=True,
-    yticklabels=False,
+    cell_df.loc[top30_idx], cmap="YlOrRd", ax=ax,
+    xticklabels=True, yticklabels=False,
     cbar_kws={"label": "Cell Importance"}
 )
-ax.set_title("Cell Explainability: Top-30 Geo-Important Points x Features", fontsize=14)
-ax.set_xlabel("Feature")
-ax.set_ylabel("Point (top-30 by geo importance)")
+ax.set_title("Cell Explainability: Top-30 Geo-Score Properties × Players", fontsize=14)
+ax.set_xlabel("Player"); ax.set_ylabel("Property (top-30 by geo score)")
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 21: Map — Cell Importance for Top Feature
+# Step 21: Map — Signed Cell Importance for Top Player
 # ============================================================
 
-top_feature = feature_importance_abs.idxmax()
-print(f"\nMost spatially influential feature: {top_feature}")
+top_player    = feature_importance_abs.idxmax()
+_ctop_abs_max = gdf_train[f"cell_signed_{top_player}"].abs().max()
+print(f"\nMost important player overall: {top_player}")
 
 fig, ax = plt.subplots(figsize=(12, 8))
-gdf_train.plot(column=f"cell_{top_feature}", cmap="hot_r", legend=True, markersize=50, ax=ax)
-ax.set_title(f"Cell Importance Map: {top_feature}", fontsize=15)
+gdf_train.plot(
+    column=f"cell_signed_{top_player}", cmap="RdBu_r", legend=True,
+    markersize=50, ax=ax, vmin=-_ctop_abs_max, vmax=_ctop_abs_max
+)
+ax.set_title(f"Cell Importance Map: {top_player}", fontsize=15)
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
 plt.tight_layout(); plt.show()
 
@@ -652,7 +668,6 @@ plt.tight_layout(); plt.show()
 # ============================================================
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
 for ax, obs, pred, title in [
     (axes[0], sg_te, pred_geo_te,
      f"Geo Surrogate (R2={geo_fidelity['R2 Fidelity']:.3f}, kernel={best_k_geo})"),
@@ -663,7 +678,6 @@ for ax, obs, pred, title in [
     lo, hi = min(obs.min(), pred.min()), max(obs.max(), pred.max())
     ax.plot([lo, hi], [lo, hi], "--", color="red")
     ax.set_title(title); ax.set_xlabel("Observed Shift"); ax.set_ylabel("Predicted Shift")
-
 plt.tight_layout(); plt.show()
 
 
@@ -677,29 +691,25 @@ SURROGATES = {
     "Random Forest": RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42, n_jobs=-1),
     "SVR":           SVR(kernel="rbf", C=1.0),
     "KNN":           KNeighborsRegressor(n_neighbors=5),
-    "XGBoost":       xgb.XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.1, verbosity=0, random_state=42),
-    "LightGBM":      lgb.LGBMRegressor(n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42, verbose=-1),
+    "XGBoost":       xgb.XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.1,
+                                       verbosity=0, random_state=42),
+    "LightGBM":      lgb.LGBMRegressor(n_estimators=100, max_depth=4, learning_rate=0.1,
+                                        random_state=42, verbose=-1),
 }
 WEIGHT_SUPPORT = {"Ridge", "Decision Tree", "Random Forest", "XGBoost", "LightGBM"}
 
-geo_r2s  = {}
-feat_r2s = {}
-
+geo_r2s = {}; feat_r2s = {}
 for name, model in SURROGATES.items():
     kw_geo  = {"sample_weight": geo_w_tr}  if name in WEIGHT_SUPPORT else {}
     kw_feat = {"sample_weight": feat_w_tr} if name in WEIGHT_SUPPORT else {}
-
-    model.fit(M_geo_tr,  sg_tr, **kw_geo);  geo_r2s[name]  = r2_score(sg_te, model.predict(M_geo_te))
-    model.fit(M_feat_tr, sf_tr, **kw_feat); feat_r2s[name] = r2_score(sf_te, model.predict(M_feat_te))
+    model.fit(M_geo_tr,  sg_tr, **kw_geo);   geo_r2s[name]  = r2_score(sg_te, model.predict(M_geo_te))
+    model.fit(M_feat_tr, sf_tr, **kw_feat);  feat_r2s[name] = r2_score(sf_te, model.predict(M_feat_te))
 
 comparison_df = pd.DataFrame({
-    "Model":      list(geo_r2s.keys()),
-    "Geo R2":     list(geo_r2s.values()),
+    "Model": list(geo_r2s), "Geo R2": list(geo_r2s.values()),
     "Feature R2": list(feat_r2s.values()),
 }).sort_values("Geo R2", ascending=False).reset_index(drop=True)
-
-print("\nSurrogate model comparison:")
-display(comparison_df)
+print("\nSurrogate model comparison:"); display(comparison_df)
 
 fig, ax = plt.subplots(figsize=(10, 5))
 x = np.arange(len(comparison_df)); w = 0.35
@@ -719,31 +729,30 @@ n_repeats_stab = 10
 n_subsets_stab = 1000
 top_pct_geo    = 20
 
-geo_runs     = []
-geo_fid_runs = []
+geo_runs = []; geo_fid_runs = []
 
 for seed in tqdm(range(10, 10 + n_repeats_stab), desc="Geo stability runs"):
     np.random.seed(seed)
-    M_r = np.zeros((n_subsets_stab, n_points), dtype=np.int8); ys = []
+    M_r = np.zeros((n_subsets_stab, n_groups), dtype=np.int8); ys = []
 
     for j in range(n_subsets_stab):
         g   = np.random.randint(min_groups, max_groups + 1)
         sel = np.random.choice(n_groups, size=g, replace=False)
         idx = np.where(np.isin(spatial_group_labels, sel))[0]
         if len(idx) == 0: ys.append(0.0); continue
-        X_p = X_train.copy(); X_p.iloc[idx] = baseline_values.values
+        X_p = X_train.copy()
+        X_p.loc[X_train.index[idx], spatial_features] = baseline_values[spatial_features].values
         pp  = automl.predict(X_p)
-        ys.append(wasserstein_distance(original_preds[idx], pp[idx])); M_r[j, idx] = 1
+        ys.append(wasserstein_distance(original_preds[idx], pp[idx]))
+        M_r[j, sel] = 1
 
-    ys   = np.array(ys)
-    gid_r = M_r.sum(axis=1).astype(float) / n_points   # input distance for this repeat
-    Mt, Me, st, se, gid_tr_r, _ = train_test_split(
-        M_r, ys, gid_r, test_size=0.25, random_state=42
-    )
-    w  = np.clip(apply_kernel(gid_tr_r, best_k_geo), 1e-8, None)  # INPUT dist → weight
+    ys    = np.array(ys)
+    gid_r = M_r.sum(axis=1).astype(float) / n_groups
+    Mt, Me, st, se, gd_tr, _ = train_test_split(M_r, ys, gid_r, test_size=0.25, random_state=42)
+    w  = np.clip(apply_kernel(gd_tr, best_k_geo), 1e-8, None)
     rr = Ridge(alpha=1.0); rr.fit(Mt, st, sample_weight=w)
     geo_fid_runs.append(r2_score(se, rr.predict(Me)))
-    geo_runs.append(pd.Series(rr.coef_, index=X_train.index).abs())
+    geo_runs.append(pd.Series(rr.coef_[spatial_group_labels], index=X_train.index).abs())
 
 geo_runs_df = pd.DataFrame(geo_runs).T
 geo_runs_df.columns = [f"run_{i+1}" for i in range(n_repeats_stab)]
@@ -773,46 +782,44 @@ for k, v in geo_stability.items(): print(f"  {k}: {v:.4f}")
 # ============================================================
 # Step 26: Stability — Feature Branch (local importance)
 # ============================================================
-# Each repeat re-runs K feature perturbations with a new seed,
-# computes local importance per point, then compares the
-# resulting (n_points x n_features) matrices pairwise.
-# ============================================================
 
-top_pct_feat   = 50
-feat_runs      = []
-feat_fid_runs  = []
+top_pct_feat  = 50
+feat_runs     = []; feat_fid_runs = []
 
 for seed in tqdm(range(10, 10 + n_repeats_stab), desc="Feature stability runs"):
     np.random.seed(seed)
-    M_r   = np.zeros((n_subsets_stab, n_feats),  dtype=np.int8)
-    pp_r  = np.zeros((n_subsets_stab, n_points), dtype=np.float32)
-    ys    = []
+    M_r  = np.zeros((n_subsets_stab, n_players), dtype=np.int8)
+    pp_r = np.zeros((n_subsets_stab, n_points),  dtype=np.float32)
+    ys   = []
 
     for j in range(n_subsets_stab):
-        mask = np.random.randint(0, 2, size=n_feats); M_r[j] = mask
-        X_p  = X_train.copy()
-        for ki, feat in enumerate(features):
-            if mask[ki] == 0: X_p[feat] = baseline_values[feat]
-        pp   = automl.predict(X_p); pp_r[j] = pp
+        removal = np.random.randint(0, 2, size=n_players); M_r[j] = removal
+        X_p = X_train.copy()
+        for ki, player in enumerate(players):
+            if removal[ki] == 1:
+                if player == "location":
+                    X_p[spatial_features] = baseline_values[spatial_features].values
+                else:
+                    X_p[player] = baseline_values[player]
+        pp = automl.predict(X_p); pp_r[j] = pp
         ys.append(wasserstein_distance(original_preds, pp))
 
-    ys = np.array(ys)
-    hd_r = (M_r == 0).sum(axis=1).astype(float) / n_feats  # input Hamming dist for this repeat
+    ys   = np.array(ys)
+    hd_r = M_r.sum(axis=1).astype(float) / n_players
     Mt, Me, st, se, hd_tr_r, _ = train_test_split(M_r, ys, hd_r, test_size=0.25, random_state=42)
     w  = np.clip(apply_kernel(hd_tr_r, best_k_feat), 1e-8, None)
     rr = Ridge(alpha=1.0); rr.fit(Mt, st, sample_weight=w)
     feat_fid_runs.append(r2_score(se, rr.predict(Me)))
 
-    # Local feature importance: INPUT Hamming weights, OUTPUT response per point
     loc_w = np.clip(apply_kernel(hd_r, best_k_feat), 1e-8, None)
-    loc_r = np.zeros((n_points, n_feats), dtype=np.float32)
+    loc_r = np.zeros((n_points, n_players), dtype=np.float32)
     for i in range(n_points):
-        y_i = pp_r[:, i] - original_preds[i]
+        y_i = original_preds[i] - pp_r[:, i]           # original − perturbed
         rri = Ridge(alpha=1.0); rri.fit(M_r, y_i, sample_weight=loc_w)
         loc_r[i] = rri.coef_
     feat_runs.append(np.abs(loc_r).flatten())
 
-feat_runs_arr = np.array(feat_runs)   # (n_repeats x (n_points * n_feats))
+feat_runs_arr = np.array(feat_runs)
 
 feat_sp, feat_pr, feat_jc = [], [], []
 for a, b in combinations(range(n_repeats_stab), 2):
@@ -837,46 +844,40 @@ for k, v in feat_stability.items(): print(f"  {k}: {v:.4f}")
 
 
 # ============================================================
-# Step 27: Sparsity & Entropy — helper
+# Step 27: Sparsity & Entropy
 # ============================================================
 
 def sparsity_entropy_metrics(scores_raw, label=""):
     s = np.nan_to_num(np.asarray(scores_raw, dtype=float), nan=0.0)
     n = len(s); eps = 1e-12
-
     q90         = np.percentile(s, 90)
     top10_ratio = (s >= q90).sum() / n
     l1_n = np.sum(np.abs(s)); l2_n = np.sqrt(np.sum(s ** 2))
     hoyer = (np.sqrt(n) - l1_n / (l2_n + eps)) / (np.sqrt(n) - 1) if l2_n > eps else np.nan
     sorted_s = np.sort(s); cumul = np.cumsum(sorted_s)
     gini  = (n + 1 - 2 * np.sum(cumul) / (cumul[-1] + eps)) / n if cumul[-1] > eps else np.nan
-
     total = s.sum()
     if total > eps:
         p = s[s > 0] / total; ent = -np.sum(p * np.log(p))
         norm_ent = ent / np.log(n); eff_n = np.exp(ent); eff_r = eff_n / n
     else:
         ent = norm_ent = eff_n = eff_r = np.nan
-
     metrics = {
-        "Top-10% Active Ratio": top10_ratio,
-        "Hoyer Sparsity":       hoyer,
-        "Gini Concentration":   gini,
-        "Entropy":              ent,
-        "Normalized Entropy":   norm_ent,
-        "Effective N":          eff_n,
-        "Effective Ratio":      eff_r,
+        "Top-10% Active Ratio": top10_ratio, "Hoyer Sparsity": hoyer,
+        "Gini Concentration": gini, "Entropy": ent,
+        "Normalized Entropy": norm_ent, "Effective N": eff_n, "Effective Ratio": eff_r,
     }
     print(f"\n--- Sparsity & Entropy ({label}) ---")
     for k, v in metrics.items():
-        print(f"  {k}: {v:.4f}" if not (v is None or np.isnan(v)) else f"  {k}: NaN")
+        print(f"  {k}: {v:.4f}" if not (v is None or (isinstance(v, float) and np.isnan(v)))
+              else f"  {k}: NaN")
     return metrics
 
 
-geo_sp_ent   = sparsity_entropy_metrics(geo_importance_abs.values,         label="Geo")
-feat_sp_ent  = sparsity_entropy_metrics(feature_importance_abs.values,      label="Feature (mean local)")
+geo_sp_ent   = sparsity_entropy_metrics(geo_importance_abs.values,             label="Geo")
+feat_sp_ent  = sparsity_entropy_metrics(feature_importance_abs.values,          label="Feature (mean local)")
 local_sp_ent = sparsity_entropy_metrics(local_feat_imp_abs_df.values.flatten(), label="Local Feature (all)")
-cell_sp_ent  = sparsity_entropy_metrics(cell_matrix.flatten(),               label="Cell")
+cell_sp_ent  = sparsity_entropy_metrics(cell_matrix.flatten(),                  label="Cell")
 
 
 # ============================================================
@@ -888,15 +889,14 @@ def _rows(metrics, branch, category):
             for k, v in metrics.items()]
 
 rows = (
-    _rows(geo_fidelity,  "Geo",     "Fidelity")        +
-    _rows(feat_fidelity, "Feature", "Fidelity")        +
-    _rows(geo_stability,  "Geo",    "Stability")       +
-    _rows(feat_stability, "Feature","Stability")       +
-    _rows(geo_sp_ent,    "Geo",     "Sparsity/Entropy") +
-    _rows(feat_sp_ent,   "Feature", "Sparsity/Entropy") +
-    _rows(cell_sp_ent,   "Cell",    "Sparsity/Entropy")
+    _rows(geo_fidelity,   "Geo",     "Fidelity")         +
+    _rows(feat_fidelity,  "Feature", "Fidelity")         +
+    _rows(geo_stability,  "Geo",     "Stability")        +
+    _rows(feat_stability, "Feature", "Stability")        +
+    _rows(geo_sp_ent,     "Geo",     "Sparsity/Entropy") +
+    _rows(feat_sp_ent,    "Feature", "Sparsity/Entropy") +
+    _rows(cell_sp_ent,    "Cell",    "Sparsity/Entropy")
 )
-
 eval_df = pd.DataFrame(rows)
 print("\n--- Full Geo-SMILE Evaluation Metrics ---")
 display(eval_df)
@@ -911,14 +911,14 @@ gdf_train["geo_imp_std"]  = geo_runs_df.std(axis=1).reindex(gdf_train.index)
 
 fig, axes = plt.subplots(1, 2, figsize=(20, 8))
 gdf_train.plot(column="geo_imp_mean", cmap="plasma", legend=True, markersize=40, ax=axes[0])
-axes[0].set_title("Geo Importance — Repeated-Run Mean", fontsize=13); axes[0].axis("equal")
-gdf_train.plot(column="geo_imp_std",  cmap="magma",   legend=True, markersize=40, ax=axes[1])
-axes[1].set_title("Geo Importance — Instability (Std)", fontsize=13); axes[1].axis("equal")
+axes[0].set_title("Geo Score — Repeated-Run Mean", fontsize=13); axes[0].axis("equal")
+gdf_train.plot(column="geo_imp_std",  cmap="magma",  legend=True, markersize=40, ax=axes[1])
+axes[1].set_title("Geo Score — Instability (Std)",   fontsize=13); axes[1].axis("equal")
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 30: Top-10% Sparse Important Points Map
+# Step 30: Top-10% High Geo Score Properties
 # ============================================================
 
 q90_geo = np.percentile(geo_importance_abs.values, 90)
@@ -926,10 +926,10 @@ gdf_train["top10_geo"] = (geo_importance_abs >= q90_geo).astype(int)
 
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train[gdf_train["top10_geo"] == 0].plot(ax=ax, markersize=15, alpha=0.20, color="lightgrey")
-gdf_train[gdf_train["top10_geo"] == 1].plot(ax=ax, markersize=70, color="red", alpha=0.85,
-                                             label="Top 10% Geo Importance")
+gdf_train[gdf_train["top10_geo"] == 1].plot(ax=ax, markersize=70, color="red",
+                                             alpha=0.85, label="Top 10% Geo Score")
 ax.legend()
-ax.set_title("Geo-SMILE Sparse Important Points: Top 10%", fontsize=15)
+ax.set_title("Geo-SMILE: Top-10% High Distributional Geo Score Properties", fontsize=15)
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
 plt.tight_layout(); plt.show()
 
