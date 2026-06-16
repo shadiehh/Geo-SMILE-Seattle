@@ -116,7 +116,7 @@ print(pd.Series(spatial_group_labels).value_counts().describe())
 # ============================================================
 
 automl = AutoML()
-automl.fit(X_train, y_train, task="regression", time_budget=20, metric="r2", verbose=0)
+automl.fit(X_train, y_train, task="regression", time_budget=20, metric="r2", verbose=0, seed=42)
 
 train_preds   = automl.predict(X_train)
 test_preds    = automl.predict(X_test)
@@ -181,6 +181,8 @@ def select_best_kernel(M_tr, M_va, input_dist_tr, response_tr, response_va):
 # rather than measuring complete-profile replacement sensitivity.
 # ============================================================
 
+np.random.seed(42)  # reproducibility of the main (non-stability) perturbation draws
+
 n_points   = X_train.shape[0]
 n_subsets  = 3000
 min_groups = 5
@@ -212,7 +214,10 @@ print(f"\nGeo shifts — mean: {y_shifts_geo.mean():.4f}, std: {y_shifts_geo.std
 # Step 7: Kernel Selection — Geo Branch (3-way split)
 # ============================================================
 # geo_input_dist = proportion of spatial GROUPS selected per perturbation
-# (not proportion of points — the group is the perturbation unit).
+# (not proportion of points — the group is the perturbation unit). This is a
+# coalition-size / mask-space distance (how much of the group-mask vector
+# differs), NOT a geographic proximity measure — it carries no notion of how
+# close two selected groups are to each other on the map.
 # Three-way split: kernel chosen on validation, fidelity on test.
 # ============================================================
 
@@ -243,13 +248,21 @@ geo_w_tr = np.clip(apply_kernel(gid_tr, best_k_geo), 1e-8, None)
 # n_groups coefficients, one per spatial cluster.
 # Each training property is assigned its cluster's coefficient →
 # "property-indexed distributional geo score" (not a locally fitted value).
-# Fidelity reported on the held-out test set.
+# The kernel was chosen on the validation split (Step 7); once it is fixed,
+# the validation perturbations carry no further selection risk, so the FINAL
+# coefficients are fit on train+validation combined (80% of n_subsets) rather
+# than train alone (60%). Fidelity is still reported on the untouched test
+# set, evaluated exactly once.
 # ============================================================
 
-ridge_geo = Ridge(alpha=1.0)
-ridge_geo.fit(M_geo_tr, sg_tr, sample_weight=geo_w_tr)
+M_geo_trva = np.vstack([M_geo_tr, M_geo_va])
+sg_trva    = np.concatenate([sg_tr, sg_va])
+gid_trva   = np.concatenate([gid_tr, gid_va])
+geo_w_trva = np.clip(apply_kernel(gid_trva, best_k_geo), 1e-8, None)
 
-pred_geo_tr = ridge_geo.predict(M_geo_tr)
+ridge_geo = Ridge(alpha=1.0)
+ridge_geo.fit(M_geo_trva, sg_trva, sample_weight=geo_w_trva)
+
 pred_geo_te = ridge_geo.predict(M_geo_te)
 
 geo_fidelity = {
@@ -384,21 +397,32 @@ for k, v in feat_fidelity.items():
 # Response: r_ik = f(x_i) - f(x_i^(k))   (original minus perturbed).
 # Locality weights from INPUT Hamming distance of training perturbations.
 # Local fidelity: per-property R² on the held-out test perturbations.
+# If a property's held-out responses are (numerically) constant — e.g. every
+# test perturbation produced the same shift for that property — R² is
+# undefined, not "perfect" or "zero". Such properties are flagged NaN rather
+# than silently scored, and excluded from the summary stats below.
 # ============================================================
 
+_ZERO_VAR_TOL = 1e-10
+
 local_feat_imp   = np.zeros((n_points, n_players), dtype=np.float32)
-local_r2_scores  = np.zeros(n_points, dtype=np.float32)
+local_r2_scores  = np.full(n_points, np.nan, dtype=np.float32)
 
 local_weights_tr = np.clip(apply_kernel(fhd_tr, best_k_feat), 1e-8, None)
 
+n_zero_var_skipped = 0
 for i in tqdm(range(n_points), desc="Local player importance per property"):
     y_i_tr = original_preds[i] - all_pert_preds_feat[feat_tr_idx, i]  # original − perturbed
     y_i_te = original_preds[i] - all_pert_preds_feat[feat_te_idx, i]
 
     ridge_i = Ridge(alpha=1.0)
     ridge_i.fit(M_feat_tr, y_i_tr, sample_weight=local_weights_tr)
-    local_feat_imp[i]  = ridge_i.coef_
-    local_r2_scores[i] = r2_score(y_i_te, ridge_i.predict(M_feat_te))
+    local_feat_imp[i] = ridge_i.coef_
+
+    if np.var(y_i_te) > _ZERO_VAR_TOL:
+        local_r2_scores[i] = r2_score(y_i_te, ridge_i.predict(M_feat_te))
+    else:
+        n_zero_var_skipped += 1
 
 local_feat_imp_df     = pd.DataFrame(local_feat_imp,          index=X_train.index, columns=players)
 local_feat_imp_abs_df = pd.DataFrame(np.abs(local_feat_imp),  index=X_train.index, columns=players)
@@ -411,11 +435,13 @@ print("\nGlobal player importance (mean of local):")
 display(feature_importance_abs.sort_values(ascending=False).to_frame("mean_local_importance"))
 
 print(f"\nLocal fidelity (per-property R² on held-out test perturbations):")
-print(f"  Median : {np.median(local_r2_scores):.4f}")
-print(f"  Mean   : {local_r2_scores.mean():.4f}  Std: {local_r2_scores.std():.4f}")
-print(f"  IQR    : {np.percentile(local_r2_scores,25):.4f} – "
-      f"{np.percentile(local_r2_scores,75):.4f}")
-print(f"  Prop > 0.50 R²: {(local_r2_scores > 0.50).mean():.2%}")
+print(f"  Properties with zero-variance held-out response (R² undefined, excluded): {n_zero_var_skipped}")
+print(f"  Median : {np.nanmedian(local_r2_scores):.4f}")
+print(f"  Mean   : {np.nanmean(local_r2_scores):.4f}  Std: {np.nanstd(local_r2_scores):.4f}")
+print(f"  IQR    : {np.nanpercentile(local_r2_scores,25):.4f} – "
+      f"{np.nanpercentile(local_r2_scores,75):.4f}")
+_valid_r2 = local_r2_scores[~np.isnan(local_r2_scores)]
+print(f"  Prop > 0.50 R²: {(_valid_r2 > 0.50).mean():.2%}  (of properties with defined R²)")
 
 
 # ============================================================
@@ -459,6 +485,10 @@ for player in players:
     data_train[f"local_{player}"]        = local_feat_imp_abs_df[player]
     data_train[f"local_signed_{player}"] = local_feat_imp_df[player]
     data_train[f"cell_{player}"]         = cell_df[player]
+    # cell_signed inherits its sign ENTIRELY from the local player coefficient.
+    # The geo factor in cell_df is abs/magnitude-only (geo_norm, Step 13) and
+    # therefore contributes no direction of its own — it can only scale the
+    # magnitude of the (already-signed) local contribution up or down.
     data_train[f"cell_signed_{player}"]  = cell_df[player] * np.sign(local_feat_imp_df[player])
 
 data_train["dominant_player"] = local_feat_imp_abs_df.idxmax(axis=1)
@@ -556,7 +586,10 @@ plt.tight_layout(); plt.show()
 # Y-axis: players sorted by mean |local importance| (ascending).
 # X-axis: signed local importance value for each training property.
 # Dot colour: standardised player value (red=high, blue=low).
-# For the "location" player, UTM_X is used as the colour proxy.
+# "location" is 2-D (UTM_X + UTM_Y jointly) and has no single scalar value to
+# colour by — UTM_X alone would be an arbitrary, misleading proxy (UTM_Y or a
+# distance-from-center measure would colour the same row differently). That
+# row is therefore drawn in a neutral grey instead of the value colormap.
 # ============================================================
 
 _sorted_players = feature_importance_abs.sort_values(ascending=True).index.tolist()
@@ -565,9 +598,12 @@ fig, ax = plt.subplots(figsize=(12, max(6, len(_sorted_players) * 0.55 + 1.5)))
 np.random.seed(0)
 for i, player in enumerate(_sorted_players):
     imp_vals  = local_feat_imp_df[player].values
-    raw_vals  = X_train["UTM_X"].values if player == "location" else X_train[player].values
-    feat_norm = (raw_vals - raw_vals.min()) / (raw_vals.max() - raw_vals.min() + 1e-12)
     y_jitter  = i + np.random.uniform(-0.35, 0.35, size=len(imp_vals))
+    if player == "location":
+        ax.scatter(imp_vals, y_jitter, color="grey", alpha=0.55, s=10, linewidths=0)
+        continue
+    raw_vals  = X_train[player].values
+    feat_norm = (raw_vals - raw_vals.min()) / (raw_vals.max() - raw_vals.min() + 1e-12)
     ax.scatter(imp_vals, y_jitter, c=feat_norm, cmap="RdBu_r",
                alpha=0.55, s=10, vmin=0, vmax=1, linewidths=0)
 
@@ -586,14 +622,20 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 17c: Dependence Plots — % Change in Price per Feature
+# Step 17c: Local Player Removal Contributions Across Feature Values
 # ============================================================
 # Inspired by GeoShapley-style dependence plots.
-# For each non-spatial player: x-axis = raw feature value, y-axis = % change
-# in price implied by that property's local signed importance
+# These show how the LOCAL baseline-removal contribution (Step 12's Ridge
+# coefficient for that player at that property) varies with the property's
+# observed feature value. They are NOT marginal/causal effect estimates —
+# each point is a per-property local-surrogate coefficient, not a controlled
+# perturbation of that single feature in isolation.
+# For each non-spatial player: x-axis = raw feature value, y-axis = estimated
+# price change associated with neutralising that player
 # (100 * (exp(local_signed_importance) - 1), since target = log_price).
-# Red dashed line = LOWESS smooth; grey band = 95% bootstrap CI of the smooth.
-# "location" is 2-D and is shown as a map (Steps 16b/18), not a 1-D dependence plot.
+# Red dashed line = LOWESS trend through the points; grey band = 95%
+# bootstrap CI of that trend.
+# "location" is 2-D and is shown as a map (Steps 16b/18), not a 1-D plot here.
 # ============================================================
 
 def _dependence_plot(ax, raw_vals, signed_local_imp, label, n_boot=80, frac=0.5):
@@ -628,7 +670,7 @@ def _dependence_plot(ax, raw_vals, signed_local_imp, label, n_boot=80, frac=0.5)
     ax.plot(grid, fit[:, 1], color="red", linestyle="--", lw=1.5)
     ax.axhline(0, color="black", lw=0.6, ls=":")
     ax.set_xlabel(label, fontsize=11)
-    ax.set_ylabel("% change in price", fontsize=10)
+    ax.set_ylabel("Est. price change from\nplayer neutralisation (%)", fontsize=10)
 
 
 _dep_players = [p for p in players if p != "location"]
@@ -646,7 +688,7 @@ for idx in range(len(_dep_players), len(axes_flat)):
     axes_flat[idx].set_visible(False)
 
 fig.suptitle(
-    "Non-linear Effects of Housing Features on House Price",
+    "Local Player Removal Contributions Across Feature Values",
     fontsize=15, y=1.02
 )
 plt.tight_layout(); plt.show()
@@ -792,6 +834,13 @@ plt.tight_layout(); plt.show()
 # ============================================================
 # Step 24: Surrogate Model Comparison
 # ============================================================
+# Evaluated on the VALIDATION split, not the test split — the test set is
+# reserved exclusively for the one-time fidelity numbers already reported in
+# Steps 8/11 for the selected Ridge surrogate. Comparing candidate models on
+# test here would mean reading the test set a second time for a decision
+# (which model "looks best"), which is exactly the kind of repeated peeking
+# the train/val/test split is meant to prevent.
+# ============================================================
 
 SURROGATES = {
     "Ridge":         Ridge(alpha=1.0),
@@ -810,21 +859,21 @@ geo_r2s = {}; feat_r2s = {}
 for name, model in SURROGATES.items():
     kw_geo  = {"sample_weight": geo_w_tr}  if name in WEIGHT_SUPPORT else {}
     kw_feat = {"sample_weight": feat_w_tr} if name in WEIGHT_SUPPORT else {}
-    model.fit(M_geo_tr,  sg_tr, **kw_geo);   geo_r2s[name]  = r2_score(sg_te, model.predict(M_geo_te))
-    model.fit(M_feat_tr, sf_tr, **kw_feat);  feat_r2s[name] = r2_score(sf_te, model.predict(M_feat_te))
+    model.fit(M_geo_tr,  sg_tr, **kw_geo);   geo_r2s[name]  = r2_score(sg_va, model.predict(M_geo_va))
+    model.fit(M_feat_tr, sf_tr, **kw_feat);  feat_r2s[name] = r2_score(sf_va, model.predict(M_feat_va))
 
 comparison_df = pd.DataFrame({
     "Model": list(geo_r2s), "Geo R2": list(geo_r2s.values()),
     "Feature R2": list(feat_r2s.values()),
 }).sort_values("Geo R2", ascending=False).reset_index(drop=True)
-print("\nSurrogate model comparison:"); display(comparison_df)
+print("\nSurrogate model comparison (validation set):"); display(comparison_df)
 
 fig, ax = plt.subplots(figsize=(10, 5))
 x = np.arange(len(comparison_df)); w = 0.35
 ax.bar(x - w/2, comparison_df["Geo R2"],     w, label="Geo Branch",     color="steelblue")
 ax.bar(x + w/2, comparison_df["Feature R2"], w, label="Feature Branch", color="darkorange")
 ax.set_xticks(x); ax.set_xticklabels(comparison_df["Model"], rotation=45, ha="right")
-ax.set_ylabel("Test R2"); ax.set_title("Surrogate Model Comparison — Geo vs Feature")
+ax.set_ylabel("Validation R2"); ax.set_title("Surrogate Model Comparison — Geo vs Feature (Validation Set)")
 ax.legend(); ax.grid(axis="y")
 plt.tight_layout(); plt.show()
 
@@ -1041,9 +1090,16 @@ plt.tight_layout(); plt.show()
 # ============================================================
 # Step 30: Top-10% High Geo Score Properties
 # ============================================================
+# Threshold computed on the 100 GROUP-level coefficients, not the duplicated
+# per-property broadcast — group sizes differ, so percentiling the broadcast
+# array would let larger clusters dominate the threshold and the resulting
+# count of highlighted properties. Groups above the threshold are selected
+# first; membership is then mapped back to properties only for display.
+# ============================================================
 
-q90_geo = np.percentile(geo_importance_abs.values, 90)
-gdf_train["top10_geo"] = (geo_importance_abs >= q90_geo).astype(int)
+group_threshold = np.percentile(geo_group_importance_abs, 90)
+top_groups = np.where(geo_group_importance_abs >= group_threshold)[0]
+gdf_train["top10_geo"] = np.isin(spatial_group_labels, top_groups).astype(int)
 
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train[gdf_train["top10_geo"] == 0].plot(ax=ax, markersize=15, alpha=0.20, color="lightgrey")
