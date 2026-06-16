@@ -142,13 +142,18 @@ def apply_kernel(distances, kernel_type, sigma=None):
     raise ValueError(f"Unknown kernel: {kernel_type}")
 
 
-def select_best_kernel(M_tr, M_te, shifts_tr, shifts_te):
+def select_best_kernel(M_tr, M_te, input_dist_tr, response_tr, response_te):
+    """
+    input_dist_tr : input-space distances -> locality weights (SMILE: perturbation distance)
+    response_tr/te: output-space shifts   -> surrogate target (SMILE: prediction difference)
+    Keeping these quantities separate is required by the SMILE locality principle.
+    """
     results = {}
     for k in KERNELS:
-        w = np.clip(apply_kernel(shifts_tr, k), 1e-8, None)
+        w = np.clip(apply_kernel(input_dist_tr, k), 1e-8, None)
         ridge = Ridge(alpha=1.0)
-        ridge.fit(M_tr, shifts_tr, sample_weight=w)
-        results[k] = r2_score(shifts_te, ridge.predict(M_te))
+        ridge.fit(M_tr, response_tr, sample_weight=w)
+        results[k] = r2_score(response_te, ridge.predict(M_te))
     best = max(results, key=results.get)
     return best, results
 
@@ -187,19 +192,31 @@ print(f"\nGeo shifts — mean: {y_shifts_geo.mean():.4f}, std: {y_shifts_geo.std
 # ============================================================
 # Step 7: Kernel Selection — Geo Branch
 # ============================================================
+# Input distance = proportion of training points perturbed.
+# This measures how far each perturbation is from the original
+# spatial configuration in INPUT space, independently of the
+# Wasserstein shift (the OUTPUT response).
+# ============================================================
 
-M_geo_tr, M_geo_te, sg_tr, sg_te = train_test_split(
-    M_geo, y_shifts_geo, test_size=0.25, random_state=42
+# Proportion of training points neutralised in each perturbation
+geo_input_dist = M_geo.sum(axis=1).astype(float) / n_points
+
+M_geo_tr, M_geo_te, sg_tr, sg_te, gid_tr, gid_te = train_test_split(
+    M_geo, y_shifts_geo, geo_input_dist, test_size=0.25, random_state=42
 )
 
-best_k_geo, k_scores_geo = select_best_kernel(M_geo_tr, M_geo_te, sg_tr, sg_te)
+best_k_geo, k_scores_geo = select_best_kernel(
+    M_geo_tr, M_geo_te,
+    gid_tr,           # INPUT distance -> weight
+    sg_tr, sg_te      # OUTPUT Wasserstein shift -> response
+)
 
 print("\nKernel R2 — Geo branch:")
 for k, v in sorted(k_scores_geo.items(), key=lambda x: -x[1]):
     marker = " <- best" if k == best_k_geo else ""
     print(f"  {k:<14} {v:.4f}{marker}")
 
-geo_w_tr = np.clip(apply_kernel(sg_tr, best_k_geo), 1e-8, None)
+geo_w_tr = np.clip(apply_kernel(gid_tr, best_k_geo), 1e-8, None)
 
 
 # ============================================================
@@ -207,7 +224,7 @@ geo_w_tr = np.clip(apply_kernel(sg_tr, best_k_geo), 1e-8, None)
 # ============================================================
 
 ridge_geo = Ridge(alpha=1.0)
-ridge_geo.fit(M_geo_tr, sg_tr, sample_weight=geo_w_tr)
+ridge_geo.fit(M_geo_tr, sg_tr, sample_weight=geo_w_tr)  # weight=INPUT dist, response=OUTPUT Wasserstein
 
 pred_geo_tr = ridge_geo.predict(M_geo_tr)
 pred_geo_te = ridge_geo.predict(M_geo_te)
@@ -264,19 +281,33 @@ print(f"\nFeature shifts — mean: {y_shifts_feat.mean():.4f}, std: {y_shifts_fe
 # ============================================================
 # Step 10: Kernel Selection — Feature Branch
 # ============================================================
+# Input distance = normalised Hamming distance = proportion of
+# features masked to baseline in each perturbation.
+# This is computed from M_feat (INPUT space) independently of
+# the Wasserstein shift (OUTPUT space), fixing the circularity
+# present when the same quantity is used for both weight and
+# response.
+# ============================================================
 
-M_feat_tr, M_feat_te, sf_tr, sf_te = train_test_split(
-    M_feat, y_shifts_feat, test_size=0.25, random_state=42
+# Proportion of features masked in each perturbation (input distance)
+feat_hamming_dist = (M_feat == 0).sum(axis=1).astype(float) / n_feats
+
+M_feat_tr, M_feat_te, sf_tr, sf_te, fhd_tr, fhd_te = train_test_split(
+    M_feat, y_shifts_feat, feat_hamming_dist, test_size=0.25, random_state=42
 )
 
-best_k_feat, k_scores_feat = select_best_kernel(M_feat_tr, M_feat_te, sf_tr, sf_te)
+best_k_feat, k_scores_feat = select_best_kernel(
+    M_feat_tr, M_feat_te,
+    fhd_tr,           # INPUT Hamming distance -> weight
+    sf_tr, sf_te      # OUTPUT Wasserstein shift -> response
+)
 
 print("\nKernel R2 — Feature branch:")
 for k, v in sorted(k_scores_feat.items(), key=lambda x: -x[1]):
     marker = " <- best" if k == best_k_feat else ""
     print(f"  {k:<14} {v:.4f}{marker}")
 
-feat_w_tr = np.clip(apply_kernel(sf_tr, best_k_feat), 1e-8, None)
+feat_w_tr = np.clip(apply_kernel(fhd_tr, best_k_feat), 1e-8, None)
 
 
 # ============================================================
@@ -288,7 +319,7 @@ feat_w_tr = np.clip(apply_kernel(sf_tr, best_k_feat), 1e-8, None)
 # ============================================================
 
 ridge_feat_global = Ridge(alpha=1.0)
-ridge_feat_global.fit(M_feat_tr, sf_tr, sample_weight=feat_w_tr)
+ridge_feat_global.fit(M_feat_tr, sf_tr, sample_weight=feat_w_tr)  # weight=INPUT Hamming, response=OUTPUT Wasserstein
 
 pred_feat_tr = ridge_feat_global.predict(M_feat_tr)
 pred_feat_te = ridge_feat_global.predict(M_feat_te)
@@ -321,12 +352,16 @@ for k, v in feat_fidelity.items():
 
 local_feat_imp = np.zeros((n_points, n_feats), dtype=np.float32)
 
+# Locality weights from INPUT Hamming distance — identical for every point.
+# Only the response y_i (prediction change at point i) varies per point.
+# This properly separates: INPUT distance -> weight, OUTPUT change -> response.
+local_weights = np.clip(apply_kernel(feat_hamming_dist, best_k_feat), 1e-8, None)
+
 for i in tqdm(range(n_points), desc="Local feature importance per point"):
-    y_i = all_pert_preds_feat[:, i] - original_preds[i]   # (K,)
-    w_i = np.clip(apply_kernel(np.abs(y_i), best_k_feat), 1e-8, None)
+    y_i = all_pert_preds_feat[:, i] - original_preds[i]   # OUTPUT response for point i
 
     ridge_i = Ridge(alpha=1.0)
-    ridge_i.fit(M_feat, y_i, sample_weight=w_i)
+    ridge_i.fit(M_feat, y_i, sample_weight=local_weights)  # INPUT weight, OUTPUT response
     local_feat_imp[i] = ridge_i.coef_
 
 local_feat_imp_df     = pd.DataFrame(local_feat_imp,     index=X_train.index, columns=features)
@@ -663,17 +698,18 @@ for seed in tqdm(range(10, 10 + n_repeats_stab), desc="Feature stability runs"):
         ys.append(wasserstein_distance(original_preds, pp))
 
     ys = np.array(ys)
-    Mt, Me, st, se = train_test_split(M_r, ys, test_size=0.25, random_state=42)
-    w  = np.clip(apply_kernel(st, best_k_feat), 1e-8, None)
+    hd_r = (M_r == 0).sum(axis=1).astype(float) / n_feats  # input Hamming dist for this repeat
+    Mt, Me, st, se, hd_tr_r, _ = train_test_split(M_r, ys, hd_r, test_size=0.25, random_state=42)
+    w  = np.clip(apply_kernel(hd_tr_r, best_k_feat), 1e-8, None)
     rr = Ridge(alpha=1.0); rr.fit(Mt, st, sample_weight=w)
     feat_fid_runs.append(r2_score(se, rr.predict(Me)))
 
-    # Local feature importance for this repeat
+    # Local feature importance: INPUT Hamming weights, OUTPUT response per point
+    loc_w = np.clip(apply_kernel(hd_r, best_k_feat), 1e-8, None)
     loc_r = np.zeros((n_points, n_feats), dtype=np.float32)
     for i in range(n_points):
         y_i = pp_r[:, i] - original_preds[i]
-        w_i = np.clip(apply_kernel(np.abs(y_i), best_k_feat), 1e-8, None)
-        rri = Ridge(alpha=1.0); rri.fit(M_r, y_i, sample_weight=w_i)
+        rri = Ridge(alpha=1.0); rri.fit(M_r, y_i, sample_weight=loc_w)
         loc_r[i] = rri.coef_
     feat_runs.append(np.abs(loc_r).flatten())
 
