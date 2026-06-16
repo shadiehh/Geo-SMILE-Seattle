@@ -1,5 +1,5 @@
 # ============================================================
-# Geo-SMILE: Geo + Feature + Cell Explainability Pipeline
+# Geo-SMILE: Geo + Feature + Geo-Player Co-Salience Explainability Pipeline
 # Extension of SMILE (Aslansefat) to spatial cases
 # Local explainer: player importance computed per property
 # ============================================================
@@ -16,7 +16,13 @@ import pandas as pd
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import contextily as ctx
+
+try:
+    import contextily as ctx
+except ImportError:
+    import subprocess, sys as _sys
+    subprocess.run([_sys.executable, "-m", "pip", "install", "-q", "contextily"], check=True)
+    import contextily as ctx
 
 from tqdm import tqdm
 from scipy.stats import wasserstein_distance, spearmanr, pearsonr
@@ -257,13 +263,27 @@ print(f"\nGeo surrogate fidelity (kernel={best_k_geo}, test set):")
 for k, v in geo_fidelity.items():
     print(f"  {k}: {v:.6f}")
 
-geo_group_importance = ridge_geo.coef_                   # shape (n_groups,)
+geo_group_importance     = ridge_geo.coef_              # shape (n_groups,)
+geo_group_importance_abs = np.abs(geo_group_importance)  # MAIN geo result, group-level
+
+# y_shifts_geo (the surrogate target) is a Wasserstein DISTANCE — strictly
+# non-negative. A Ridge fit on a non-negative target can still produce signed
+# coefficients, but the sign only reflects how the linear model partitions the
+# magnitude of the shift across groups; it does NOT indicate whether a group
+# raises or lowers price. Only the ABSOLUTE coefficient — the "spatial-group
+# distributional sensitivity" — is used as the geo result everywhere downstream
+# (geo_norm, co-salience, stability, sparsity/entropy). The signed series below
+# is kept only for reference and is never interpreted directionally.
 geo_importance = pd.Series(
-    geo_group_importance[spatial_group_labels],          # map group → property
+    geo_group_importance[spatial_group_labels],          # map group → property (reference only)
     index=X_train.index,
     name="geo_importance"
 )
-geo_importance_abs = geo_importance.abs()
+geo_importance_abs = pd.Series(
+    geo_group_importance_abs[spatial_group_labels],      # map group → property
+    index=X_train.index,
+    name="geo_importance_abs"
+)
 
 
 # ============================================================
@@ -399,11 +419,14 @@ print(f"  Prop > 0.50 R²: {(local_r2_scores > 0.50).mean():.2%}")
 
 
 # ============================================================
-# Step 13: Cell Explainability
+# Step 13: Geo–Player Co-Salience Score
 # ============================================================
-# geo_norm[i]           — property-indexed distributional geo score [0,1]
-# local_feat_norm[i, j] — local player importance at property i [0,1]
-# cell[i, j]            = geo_norm[i] × local_feat_norm[i, j]
+# geo_norm[i]           — normalised spatial-group distributional sensitivity [0,1]
+# local_feat_norm[i, j] — normalised local player importance at property i [0,1]
+# cosalience[i, j]      = geo_norm[i] × local_feat_norm[i, j]
+# This is a multiplicative score: a cell is high only when BOTH the property's
+# geo sensitivity AND the player's local importance are high. It is a derived
+# co-salience score, NOT a statistically estimated interaction effect.
 # ============================================================
 
 _eps = 1e-12
@@ -419,7 +442,7 @@ local_feat_norm = (local_feat_imp_abs_df - feat_col_min) / \
 cell_matrix = geo_norm.values[:, np.newaxis] * local_feat_norm.values
 cell_df     = pd.DataFrame(cell_matrix, index=geo_norm.index, columns=players)
 
-print("\nCell importance matrix shape:", cell_df.shape)
+print("\nGeo–player co-salience matrix shape:", cell_df.shape)
 
 
 # ============================================================
@@ -447,7 +470,8 @@ gdf_train = gpd.GeoDataFrame(data_train, geometry="geometry", crs="EPSG:32610")
 def add_basemap(ax, source=None):
     """Add a real city basemap (OpenStreetMap / CARTO tiles) beneath the
     plotted points, reprojected on the fly to the GeoDataFrame's CRS
-    (GeoSHAPLY Fig 10 style). Fails silently if no internet access."""
+    (inspired by GeoShapley-style location maps). Fails silently if no
+    internet access."""
     if source is None:
         source = ctx.providers.CartoDB.Positron
     try:
@@ -457,46 +481,35 @@ def add_basemap(ax, source=None):
 
 
 # ============================================================
-# Step 15: Map — Distributional Geo Score (Absolute)
+# Step 15: Map — Spatial-Group Distributional Sensitivity
 # ============================================================
-# Each property displays the importance score of its spatial cluster.
-# The score measures each cluster's contribution to Wasserstein shift
-# when ONLY the spatial coordinates are neutralised.
-# This is a property-indexed cluster score, NOT a locally fitted value.
+# Each property displays the |Ridge coefficient| of its KMeans spatial group.
+# The score measures each group's contribution to the (non-negative)
+# Wasserstein shift when ONLY the spatial coordinates are neutralised.
+# Only the ABSOLUTE value is shown — see the note in Step 8 on why the sign
+# of this coefficient is not directionally interpretable.
+# This is a GROUP-level score broadcast to member properties, NOT a value
+# locally fitted per property.
 # ============================================================
 
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(column="geo_importance_abs", cmap="plasma", legend=True,
                markersize=50, alpha=0.85, ax=ax)
 add_basemap(ax)
-ax.set_title("Geo-SMILE: Property-Indexed Distributional Geo Score (|Cluster|)", fontsize=14)
+ax.set_title("Geo-SMILE: Spatial-Group Distributional Sensitivity", fontsize=14)
 ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 16: Map — Signed Distributional Geo Score (GeoSHAPLY Fig 10a style)
-# ============================================================
-
-_geo_abs_max = geo_importance.abs().max()
-fig, ax = plt.subplots(figsize=(12, 8))
-gdf_train.plot(
-    column="geo_importance", cmap="RdBu_r", legend=True, markersize=50, alpha=0.85, ax=ax,
-    vmin=-_geo_abs_max, vmax=_geo_abs_max
-)
-add_basemap(ax)
-ax.set_title("Geo-SMILE: Signed Distributional Geo Score (GeoSHAPLY Fig 10a Style)", fontsize=14)
-ax.set_aspect("equal"); ax.set_axis_off()
-plt.tight_layout(); plt.show()
-
-
-# ============================================================
-# Step 16b: Map — Local Location Player Importance (GeoSHAPLY Fig 10a equivalent)
+# Step 16b: Map — Local Location Player Importance
 # ============================================================
 # "location" player = joint UTM_X + UTM_Y treated as one SMILE player.
 # Its importance at property i is the Ridge coefficient from the LOCAL
 # surrogate fitted separately for each property (truly locally fitted,
-# unlike the cluster score in Step 15/16).
+# unlike the spatial-group sensitivity score in Step 15). Unlike that score,
+# this one IS signed meaningfully: the response here is
+# original − perturbed prediction (not a non-negative distance).
 # ============================================================
 
 _loc_abs_max = gdf_train["local_signed_location"].abs().max()
@@ -506,11 +519,11 @@ gdf_train.plot(
     vmin=-_loc_abs_max, vmax=_loc_abs_max
 )
 add_basemap(ax)
-ax.set_title("Geo-SMILE: Local Location Player Importance per Property (GeoSHAPLY Fig 10a)", fontsize=14)
+ax.set_title("Geo-SMILE: Local Location Player Importance per Property", fontsize=14)
 ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
-# Fig 10b equivalent: signed cell map for strongest non-location interacting player
+# Geo–player co-salience map for the player with the strongest mean co-salience with location
 _non_loc = [p for p in players if p != "location"]
 _strongest_cell = cell_df[_non_loc].mean(axis=0).idxmax()
 _cell_abs_max   = gdf_train[f"cell_signed_{_strongest_cell}"].abs().max()
@@ -520,10 +533,7 @@ gdf_train.plot(
     markersize=50, alpha=0.85, ax=ax, vmin=-_cell_abs_max, vmax=_cell_abs_max
 )
 add_basemap(ax)
-ax.set_title(
-    f"Geo-SMILE: {_strongest_cell} × Location Interaction (GeoSHAPLY Fig 10b Style)",
-    fontsize=14
-)
+ax.set_title(f"Geo-SMILE: {_strongest_cell} × Location Co-Salience", fontsize=14)
 ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
@@ -540,8 +550,9 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 17b: Beeswarm Summary — GeoSHAPLY Figure 8 Style
+# Step 17b: Beeswarm Summary of Local Player Contributions
 # ============================================================
+# Inspired by GeoShapley-style beeswarm summary plots.
 # Y-axis: players sorted by mean |local importance| (ascending).
 # X-axis: signed local importance value for each training property.
 # Dot colour: standardised player value (red=high, blue=low).
@@ -564,7 +575,7 @@ ax.set_yticks(range(len(_sorted_players)))
 ax.set_yticklabels(_sorted_players, fontsize=11)
 ax.axvline(0, color="black", lw=0.8, ls="--")
 ax.set_xlabel("GeoSMILE value (impact on model prediction)", fontsize=12)
-ax.set_title("Player Contribution Ranking — GeoSHAPLY Fig 8 Style", fontsize=14)
+ax.set_title("Player Contribution Ranking", fontsize=14)
 
 _sm = plt.cm.ScalarMappable(cmap="RdBu_r", norm=plt.Normalize(0, 1))
 _sm.set_array([])
@@ -575,8 +586,9 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 17c: Dependence Plots — % Change in Price per Feature (GeoSHAPLY Fig 9 Style)
+# Step 17c: Dependence Plots — % Change in Price per Feature
 # ============================================================
+# Inspired by GeoShapley-style dependence plots.
 # For each non-spatial player: x-axis = raw feature value, y-axis = % change
 # in price implied by that property's local signed importance
 # (100 * (exp(local_signed_importance) - 1), since target = log_price).
@@ -634,14 +646,14 @@ for idx in range(len(_dep_players), len(axes_flat)):
     axes_flat[idx].set_visible(False)
 
 fig.suptitle(
-    "Non-linear Effects of Housing Features on House Price (GeoSHAPLY Fig 9 Style)",
+    "Non-linear Effects of Housing Features on House Price",
     fontsize=15, y=1.02
 )
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 18: Maps — Local Player Importance (GeoSHAPLY Fig 9 Style)
+# Step 18: Maps — Local Player Importance
 # ============================================================
 
 ncols = 3
@@ -664,7 +676,7 @@ for idx in range(n_players, len(axes_flat)):
     axes_flat[idx].set_visible(False)
 
 fig.suptitle(
-    "Local Player Importance — Signed Spatial Distribution (GeoSHAPLY Fig 9 Style)",
+    "Local Player Importance — Signed Spatial Distribution",
     fontsize=15, y=1.01
 )
 plt.tight_layout(); plt.show()
@@ -673,10 +685,17 @@ plt.tight_layout(); plt.show()
 # ============================================================
 # Step 18b: Map — Local Surrogate Fidelity per Property
 # ============================================================
+# Local R² can be NEGATIVE (the per-property local linear surrogate fits worse
+# on held-out test perturbations than simply predicting the mean shift). The
+# colour scale is intentionally NOT clipped at 0 — vmin is set to the true
+# minimum so negative-fidelity properties stay visually distinguishable
+# instead of being flattened to the same colour as R²=0.
+# ============================================================
 
+_r2_vmin = min(0.0, float(gdf_train["local_fidelity_r2"].min()))
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(column="local_fidelity_r2", cmap="viridis", legend=True,
-               markersize=50, alpha=0.85, ax=ax, vmin=0, vmax=1)
+               markersize=50, alpha=0.85, ax=ax, vmin=_r2_vmin, vmax=1)
 add_basemap(ax)
 ax.set_title("Geo-SMILE: Local Surrogate Fidelity R² per Property", fontsize=14)
 ax.set_aspect("equal"); ax.set_axis_off()
@@ -705,7 +724,7 @@ plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 20: Heatmap — Cell Explainability (Top-30 Properties)
+# Step 20: Heatmap — Geo–Player Co-Salience (Top-30 Properties)
 # ============================================================
 
 top30_idx = geo_importance_abs.nlargest(30).index
@@ -714,15 +733,15 @@ fig, ax = plt.subplots(figsize=(14, 8))
 sns.heatmap(
     cell_df.loc[top30_idx], cmap="YlOrRd", ax=ax,
     xticklabels=True, yticklabels=False,
-    cbar_kws={"label": "Cell Importance"}
+    cbar_kws={"label": "Co-Salience Score"}
 )
-ax.set_title("Cell Explainability: Top-30 Geo-Score Properties × Players", fontsize=14)
-ax.set_xlabel("Player"); ax.set_ylabel("Property (top-30 by geo score)")
+ax.set_title("Geo–Player Co-Salience: Top-30 Geo-Sensitivity Properties × Players", fontsize=14)
+ax.set_xlabel("Player"); ax.set_ylabel("Property (top-30 by geo sensitivity)")
 plt.tight_layout(); plt.show()
 
 
 # ============================================================
-# Step 21: Map — Signed Cell Importance for Top Player
+# Step 21: Map — Signed Geo–Player Co-Salience for Top Player
 # ============================================================
 
 top_player    = feature_importance_abs.idxmax()
@@ -735,7 +754,7 @@ gdf_train.plot(
     markersize=50, alpha=0.85, ax=ax, vmin=-_ctop_abs_max, vmax=_ctop_abs_max
 )
 add_basemap(ax)
-ax.set_title(f"Cell Importance Map: {top_player}", fontsize=15)
+ax.set_title(f"Geo–Player Co-Salience Map: {top_player}", fontsize=15)
 ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 
@@ -841,30 +860,31 @@ for seed in tqdm(range(10, 10 + n_repeats_stab), desc="Geo stability runs"):
     w  = np.clip(apply_kernel(gd_tr, best_k_geo), 1e-8, None)
     rr = Ridge(alpha=1.0); rr.fit(Mt, st, sample_weight=w)
     geo_fid_runs.append(r2_score(se, rr.predict(Me)))
-    geo_runs.append(pd.Series(rr.coef_[spatial_group_labels], index=X_train.index).abs())
+    geo_runs.append(np.abs(rr.coef_))   # GROUP-level coefficients (n_groups,) — no property duplication
 
-geo_runs_df = pd.DataFrame(geo_runs).T
+geo_runs_df = pd.DataFrame(geo_runs).T          # index = spatial group id (0..n_groups-1)
 geo_runs_df.columns = [f"run_{i+1}" for i in range(n_repeats_stab)]
 
-geo_sp, geo_pr, geo_jc = [], [], []
+geo_rank_consist, geo_score_consist, geo_set_stab = [], [], []
 for a, b in combinations(geo_runs_df.columns, 2):
     sa, sb = geo_runs_df[a].values, geo_runs_df[b].values
-    geo_sp.append(spearmanr(sa, sb)[0]); geo_pr.append(pearsonr(sa, sb)[0])
+    geo_rank_consist.append(spearmanr(sa, sb)[0])
+    geo_score_consist.append(pearsonr(sa, sb)[0])
     ta = np.percentile(sa, 100 - top_pct_geo); tb = np.percentile(sb, 100 - top_pct_geo)
     A  = set(geo_runs_df.index[sa >= ta]); B = set(geo_runs_df.index[sb >= tb])
-    geo_jc.append(len(A & B) / len(A | B) if (A | B) else 1.0)
+    geo_set_stab.append(len(A & B) / len(A | B) if (A | B) else 1.0)
 
 geo_stability = {
-    "Fidelity R2 Mean":                 np.mean(geo_fid_runs),
-    "Fidelity R2 Std":                  np.std(geo_fid_runs),
-    "Spearman Stability Mean":          np.nanmean(geo_sp),
-    "Spearman Stability Std":           np.nanstd(geo_sp),
-    "Pearson Stability Mean":           np.nanmean(geo_pr),
-    "Pearson Stability Std":            np.nanstd(geo_pr),
-    f"Jaccard Top-{top_pct_geo}% Mean": np.nanmean(geo_jc),
-    f"Jaccard Top-{top_pct_geo}% Std":  np.nanstd(geo_jc),
+    "Fidelity R2 Mean":                                  np.mean(geo_fid_runs),
+    "Fidelity R2 Std":                                   np.std(geo_fid_runs),
+    "Rank Consistency Mean":                             np.nanmean(geo_rank_consist),
+    "Rank Consistency Std":                              np.nanstd(geo_rank_consist),
+    "Score Consistency Mean":                            np.nanmean(geo_score_consist),
+    "Score Consistency Std":                             np.nanstd(geo_score_consist),
+    f"Important-Set Stability Top-{top_pct_geo}% Mean":  np.nanmean(geo_set_stab),
+    f"Important-Set Stability Top-{top_pct_geo}% Std":   np.nanstd(geo_set_stab),
 }
-print("\n--- Geo Stability ---")
+print("\n--- Geo Stability (computed on the 100 group-level coefficients, not duplicated property scores) ---")
 for k, v in geo_stability.items(): print(f"  {k}: {v:.4f}")
 
 
@@ -872,7 +892,7 @@ for k, v in geo_stability.items(): print(f"  {k}: {v:.4f}")
 # Step 26: Stability — Feature Branch (local importance)
 # ============================================================
 
-top_pct_feat  = 50
+top_pct_feat  = 20
 feat_runs     = []; feat_fid_runs = []
 
 for seed in tqdm(range(10, 10 + n_repeats_stab), desc="Feature stability runs"):
@@ -910,23 +930,24 @@ for seed in tqdm(range(10, 10 + n_repeats_stab), desc="Feature stability runs"):
 
 feat_runs_arr = np.array(feat_runs)
 
-feat_sp, feat_pr, feat_jc = [], [], []
+feat_rank_consist, feat_score_consist, feat_set_stab = [], [], []
 for a, b in combinations(range(n_repeats_stab), 2):
     sa, sb = feat_runs_arr[a], feat_runs_arr[b]
-    feat_sp.append(spearmanr(sa, sb)[0]); feat_pr.append(pearsonr(sa, sb)[0])
+    feat_rank_consist.append(spearmanr(sa, sb)[0])
+    feat_score_consist.append(pearsonr(sa, sb)[0])
     ta = np.percentile(sa, 100 - top_pct_feat); tb = np.percentile(sb, 100 - top_pct_feat)
     A  = set(np.where(sa >= ta)[0]); B = set(np.where(sb >= tb)[0])
-    feat_jc.append(len(A & B) / len(A | B) if (A | B) else 1.0)
+    feat_set_stab.append(len(A & B) / len(A | B) if (A | B) else 1.0)
 
 feat_stability = {
-    "Fidelity R2 Mean":                  np.mean(feat_fid_runs),
-    "Fidelity R2 Std":                   np.std(feat_fid_runs),
-    "Spearman Stability Mean":           np.nanmean(feat_sp),
-    "Spearman Stability Std":            np.nanstd(feat_sp),
-    "Pearson Stability Mean":            np.nanmean(feat_pr),
-    "Pearson Stability Std":             np.nanstd(feat_pr),
-    f"Jaccard Top-{top_pct_feat}% Mean": np.nanmean(feat_jc),
-    f"Jaccard Top-{top_pct_feat}% Std":  np.nanstd(feat_jc),
+    "Fidelity R2 Mean":                                   np.mean(feat_fid_runs),
+    "Fidelity R2 Std":                                    np.std(feat_fid_runs),
+    "Rank Consistency Mean":                              np.nanmean(feat_rank_consist),
+    "Rank Consistency Std":                               np.nanstd(feat_rank_consist),
+    "Score Consistency Mean":                             np.nanmean(feat_score_consist),
+    "Score Consistency Std":                              np.nanstd(feat_score_consist),
+    f"Important-Set Stability Top-{top_pct_feat}% Mean":  np.nanmean(feat_set_stab),
+    f"Important-Set Stability Top-{top_pct_feat}% Std":   np.nanstd(feat_set_stab),
 }
 print("\n--- Feature Stability ---")
 for k, v in feat_stability.items(): print(f"  {k}: {v:.4f}")
@@ -939,8 +960,6 @@ for k, v in feat_stability.items(): print(f"  {k}: {v:.4f}")
 def sparsity_entropy_metrics(scores_raw, label=""):
     s = np.nan_to_num(np.asarray(scores_raw, dtype=float), nan=0.0)
     n = len(s); eps = 1e-12
-    q90         = np.percentile(s, 90)
-    top10_ratio = (s >= q90).sum() / n
     l1_n = np.sum(np.abs(s)); l2_n = np.sqrt(np.sum(s ** 2))
     hoyer = (np.sqrt(n) - l1_n / (l2_n + eps)) / (np.sqrt(n) - 1) if l2_n > eps else np.nan
     sorted_s = np.sort(s); cumul = np.cumsum(sorted_s)
@@ -952,7 +971,7 @@ def sparsity_entropy_metrics(scores_raw, label=""):
     else:
         ent = norm_ent = eff_n = eff_r = np.nan
     metrics = {
-        "Top-10% Active Ratio": top10_ratio, "Hoyer Sparsity": hoyer,
+        "Hoyer Sparsity": hoyer,
         "Gini Concentration": gini, "Entropy": ent,
         "Normalized Entropy": norm_ent, "Effective N": eff_n, "Effective Ratio": eff_r,
     }
@@ -963,10 +982,12 @@ def sparsity_entropy_metrics(scores_raw, label=""):
     return metrics
 
 
-geo_sp_ent   = sparsity_entropy_metrics(geo_importance_abs.values,             label="Geo")
+# Geo sparsity/entropy is computed on the 100 GROUP-level coefficients (not the
+# duplicated per-property broadcast), for the same reason as Step 25's stability metrics.
+geo_sp_ent   = sparsity_entropy_metrics(geo_group_importance_abs,               label="Geo (group-level)")
 feat_sp_ent  = sparsity_entropy_metrics(feature_importance_abs.values,          label="Feature (mean local)")
 local_sp_ent = sparsity_entropy_metrics(local_feat_imp_abs_df.values.flatten(), label="Local Feature (all)")
-cell_sp_ent  = sparsity_entropy_metrics(cell_matrix.flatten(),                  label="Cell")
+cell_sp_ent  = sparsity_entropy_metrics(cell_matrix.flatten(),                  label="Geo–Player Co-Salience")
 
 
 # ============================================================
@@ -982,9 +1003,10 @@ rows = (
     _rows(feat_fidelity,  "Feature", "Fidelity")         +
     _rows(geo_stability,  "Geo",     "Stability")        +
     _rows(feat_stability, "Feature", "Stability")        +
-    _rows(geo_sp_ent,     "Geo",     "Sparsity/Entropy") +
-    _rows(feat_sp_ent,    "Feature", "Sparsity/Entropy") +
-    _rows(cell_sp_ent,    "Cell",    "Sparsity/Entropy")
+    _rows(geo_sp_ent,     "Geo",     "Sparsity/Entropy")       +
+    _rows(feat_sp_ent,    "Feature", "Sparsity/Entropy")       +
+    _rows(local_sp_ent,   "Feature", "Sparsity/Entropy (Local)") +
+    _rows(cell_sp_ent,    "Co-Salience", "Sparsity/Entropy")
 )
 eval_df = pd.DataFrame(rows)
 print("\n--- Full Geo-SMILE Evaluation Metrics ---")
@@ -994,18 +1016,24 @@ display(eval_df)
 # ============================================================
 # Step 29: Stability Maps — Geo Branch
 # ============================================================
+# geo_runs_df is indexed by spatial GROUP id (Step 25). Broadcast each
+# group's mean/std back to its member properties purely for visualization —
+# the stability metrics themselves were already computed at the group level.
+# ============================================================
 
-gdf_train["geo_imp_mean"] = geo_runs_df.mean(axis=1).reindex(gdf_train.index)
-gdf_train["geo_imp_std"]  = geo_runs_df.std(axis=1).reindex(gdf_train.index)
+_geo_group_mean = geo_runs_df.mean(axis=1).values   # length n_groups
+_geo_group_std  = geo_runs_df.std(axis=1).values     # length n_groups
+gdf_train["geo_imp_mean"] = _geo_group_mean[spatial_group_labels]
+gdf_train["geo_imp_std"]  = _geo_group_std[spatial_group_labels]
 
 fig, axes = plt.subplots(1, 2, figsize=(20, 8))
 gdf_train.plot(column="geo_imp_mean", cmap="plasma", legend=True, markersize=40, alpha=0.85, ax=axes[0])
 add_basemap(axes[0])
-axes[0].set_title("Geo Score — Repeated-Run Mean", fontsize=13)
+axes[0].set_title("Spatial-Group Sensitivity — Repeated-Run Mean", fontsize=13)
 axes[0].set_aspect("equal"); axes[0].set_axis_off()
 gdf_train.plot(column="geo_imp_std",  cmap="magma",  legend=True, markersize=40, alpha=0.85, ax=axes[1])
 add_basemap(axes[1])
-axes[1].set_title("Geo Score — Instability (Std)",   fontsize=13)
+axes[1].set_title("Spatial-Group Sensitivity — Instability (Std)", fontsize=13)
 axes[1].set_aspect("equal"); axes[1].set_axis_off()
 plt.tight_layout(); plt.show()
 
@@ -1023,7 +1051,7 @@ gdf_train[gdf_train["top10_geo"] == 1].plot(ax=ax, markersize=70, color="red",
                                              alpha=0.85, label="Top 10% Geo Score")
 add_basemap(ax)
 ax.legend()
-ax.set_title("Geo-SMILE: Top-10% High Distributional Geo Score Properties", fontsize=15)
+ax.set_title("Geo-SMILE: Top-10% High Spatial-Group Distributional Sensitivity", fontsize=15)
 ax.set_aspect("equal"); ax.set_axis_off()
 plt.tight_layout(); plt.show()
 

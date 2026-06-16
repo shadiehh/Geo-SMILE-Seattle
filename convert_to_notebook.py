@@ -42,13 +42,13 @@ cells.append(make_md_cell(
     "**How to run:** Import this notebook into Kaggle and attach the dataset `shadiemohammadi/ziqi-seattle`.\n"
     "\n"
     "Branches:\n"
-    "- **Geo Branch** — group-level spatial perturbations (KMeans clusters) → property-indexed distributional geo score (collective, not locally fitted)\n"
+    "- **Geo Branch** — group-level spatial perturbations (KMeans clusters) → spatial-group distributional sensitivity (collective, not locally fitted; only the absolute Ridge coefficient is interpreted, since the surrogate target is a non-negative Wasserstein distance)\n"
     "- **Feature Branch** — player-based masking (UTM_X+UTM_Y joined as one `location` player) → genuinely local per-property player importance, with per-property local fidelity\n"
-    "- **Cell Explainability** — combined (n_points × n_players) importance matrix\n"
+    "- **Geo–Player Co-Salience** — combined (n_points × n_players) co-salience matrix (geo_norm × local feature norm; a derived score, not a statistically estimated interaction)\n"
     "\n"
-    "Includes GeoSHAPLY-style comparison plots: beeswarm summary (Fig 8), per-feature dependence plots with LOWESS trend + bootstrap CI band (Fig 9), and signed location/interaction maps over a real CartoDB basemap (Fig 10).\n"
+    "Includes GeoShapley-inspired comparison plots: a beeswarm summary, per-feature dependence plots with LOWESS trend + bootstrap CI band, and signed location/co-salience maps over a real CartoDB basemap.\n"
     "\n"
-    "Metrics: Fidelity · Stability · Sparsity · Entropy (no ground truth required)"
+    "Metrics: Fidelity · Stability (rank consistency, score consistency, important-set stability) · Sparsity · Entropy (no ground truth required)"
 ))
 
 # pip install cell
