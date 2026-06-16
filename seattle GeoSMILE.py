@@ -46,21 +46,37 @@ data = pd.read_csv(
     "/kaggle/input/datasets/shadiemohammadi/ziqi-seattle/seattle_sample_1k.csv"
 )
 
-features = [
-    "bathrooms", "sqft_living", "sqft_lot", "grade",
-    "condition", "waterfront", "view", "age",
-    "UTM_X", "UTM_Y"
-]
-
 spatial_features = ["UTM_X", "UTM_Y"]
 target = "log_price"
 
-required_cols = features + [target]
+# geo_dist replaces separate UTM_X / UTM_Y in the model: a single scalar
+# (standardised Euclidean distance from the dataset centroid) that encodes
+# spatial location as a first-class feature.  This lets the feature branch
+# produce a truly local per-point geo importance for each property —
+# consistent with the Chicago dataset where UTM_X + UTM_Y were combined into
+# one composite geo feature.
+features = [
+    "bathrooms", "sqft_living", "sqft_lot", "grade",
+    "condition", "waterfront", "view", "age",
+    "geo_dist"
+]
+
+required_cols = spatial_features + [f for f in features if f != "geo_dist"] + [target]
 missing_cols = [c for c in required_cols if c not in data.columns]
 if missing_cols:
     raise ValueError(f"Missing columns: {missing_cols}")
 
 data = data.dropna(subset=required_cols).reset_index(drop=True)
+
+# Build geo_dist from all rows (centroid computed on full dataset).
+# UTM_X and UTM_Y are retained in `data` for KMeans (Step 3) and mapping.
+_cx = data["UTM_X"].mean()
+_cy = data["UTM_Y"].mean()
+_sc = np.sqrt(data["UTM_X"].var() + data["UTM_Y"].var())
+data["geo_dist"] = (
+    np.sqrt((data["UTM_X"] - _cx) ** 2 + (data["UTM_Y"] - _cy) ** 2) / (_sc + 1e-12)
+)
+
 X = data[features].copy()
 y = data[target].copy()
 
@@ -426,7 +442,7 @@ gdf_train = gpd.GeoDataFrame(data_train, geometry="geometry", crs="EPSG:32610")
 
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(column="geo_importance_abs", cmap="plasma", legend=True, markersize=50, ax=ax)
-ax.set_title("Geo-SMILE: Point-Level Geo Importance", fontsize=15)
+ax.set_title("Geo-SMILE: Distributional Geo Importance (Geo Branch)", fontsize=15)
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
 plt.tight_layout(); plt.show()
 
@@ -437,7 +453,25 @@ plt.tight_layout(); plt.show()
 
 fig, ax = plt.subplots(figsize=(12, 8))
 gdf_train.plot(column="geo_importance", cmap="Spectral", legend=True, markersize=50, ax=ax)
-ax.set_title("Geo-SMILE: Signed Geo Importance", fontsize=15)
+ax.set_title("Geo-SMILE: Signed Distributional Geo Importance (Geo Branch)", fontsize=15)
+ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
+plt.tight_layout(); plt.show()
+
+
+# ============================================================
+# Step 16b: Map — Local Geo Importance per Point (geo_dist)
+# ============================================================
+# geo_dist is a first-class feature in the feature branch.
+# Its local importance at each point i = how much that property's
+# predicted price changes when its distance-from-centroid is masked —
+# i.e. a truly per-point local geo importance, not a distributional one.
+# ============================================================
+
+fig, ax = plt.subplots(figsize=(12, 8))
+gdf_train.plot(
+    column="local_feat_geo_dist", cmap="plasma", legend=True, markersize=50, ax=ax
+)
+ax.set_title("Geo-SMILE: Local Geo Importance per Point (geo_dist feature)", fontsize=15)
 ax.set_xlabel("UTM_X"); ax.set_ylabel("UTM_Y"); ax.axis("equal")
 plt.tight_layout(); plt.show()
 
@@ -639,9 +673,12 @@ for seed in tqdm(range(10, 10 + n_repeats_stab), desc="Geo stability runs"):
         pp  = automl.predict(X_p)
         ys.append(wasserstein_distance(original_preds[idx], pp[idx])); M_r[j, idx] = 1
 
-    ys = np.array(ys)
-    Mt, Me, st, se = train_test_split(M_r, ys, test_size=0.25, random_state=42)
-    w  = np.clip(apply_kernel(st, best_k_geo), 1e-8, None)
+    ys   = np.array(ys)
+    gid_r = M_r.sum(axis=1).astype(float) / n_points   # input distance for this repeat
+    Mt, Me, st, se, gid_tr_r, _ = train_test_split(
+        M_r, ys, gid_r, test_size=0.25, random_state=42
+    )
+    w  = np.clip(apply_kernel(gid_tr_r, best_k_geo), 1e-8, None)  # INPUT dist → weight
     rr = Ridge(alpha=1.0); rr.fit(Mt, st, sample_weight=w)
     geo_fid_runs.append(r2_score(se, rr.predict(Me)))
     geo_runs.append(pd.Series(rr.coef_, index=X_train.index).abs())
