@@ -25,7 +25,7 @@ except ImportError:
     import contextily as ctx
 
 from tqdm import tqdm
-from scipy.stats import wasserstein_distance, spearmanr, pearsonr
+from scipy.stats import wasserstein_distance, spearmanr, pearsonr, ks_2samp
 from statsmodels.nonparametric.smoothers_lowess import lowess
 from itertools import combinations
 
@@ -34,7 +34,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, LinearRegression, Lasso, ElasticNet, BayesianRidge
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.svm import SVR
@@ -188,8 +188,9 @@ n_subsets  = 3000
 min_groups = 5
 max_groups = 10
 
-M_geo        = np.zeros((n_subsets, n_groups), dtype=np.int8)
-y_shifts_geo = []
+M_geo           = np.zeros((n_subsets, n_groups), dtype=np.int8)
+y_shifts_geo    = []
+y_shifts_geo_ks = []   # Kolmogorov-Smirnov alternative to Wasserstein (Step 31 ablation)
 
 for j in tqdm(range(n_subsets), desc="Geo perturbations"):
     g   = np.random.randint(min_groups, max_groups + 1)
@@ -198,15 +199,18 @@ for j in tqdm(range(n_subsets), desc="Geo perturbations"):
 
     if len(idx) == 0:
         y_shifts_geo.append(0.0)
+        y_shifts_geo_ks.append(0.0)
         continue
 
     X_pert = X_train.copy()
     X_pert.loc[X_train.index[idx], spatial_features] = baseline_values[spatial_features].values
     pert_preds = automl.predict(X_pert)
     y_shifts_geo.append(wasserstein_distance(original_preds[idx], pert_preds[idx]))
+    y_shifts_geo_ks.append(ks_2samp(original_preds[idx], pert_preds[idx]).statistic)
     M_geo[j, sel] = 1
 
-y_shifts_geo = np.array(y_shifts_geo)
+y_shifts_geo    = np.array(y_shifts_geo)
+y_shifts_geo_ks = np.array(y_shifts_geo_ks)
 print(f"\nGeo shifts — mean: {y_shifts_geo.mean():.4f}, std: {y_shifts_geo.std():.4f}")
 
 
@@ -316,6 +320,7 @@ K_feat = 3000
 M_feat               = np.zeros((K_feat, n_players), dtype=np.int8)
 all_pert_preds_feat  = np.zeros((K_feat, n_points),  dtype=np.float32)
 y_shifts_feat        = []
+y_shifts_feat_ks     = []   # Kolmogorov-Smirnov alternative to Wasserstein (Step 31 ablation)
 
 for j in tqdm(range(K_feat), desc="Feature perturbations"):
     removal = np.random.randint(0, 2, size=n_players)   # 1 = removed
@@ -332,8 +337,10 @@ for j in tqdm(range(K_feat), desc="Feature perturbations"):
     pert_preds = automl.predict(X_pert)
     all_pert_preds_feat[j] = pert_preds
     y_shifts_feat.append(wasserstein_distance(original_preds, pert_preds))
+    y_shifts_feat_ks.append(ks_2samp(original_preds, pert_preds).statistic)
 
-y_shifts_feat = np.array(y_shifts_feat)
+y_shifts_feat    = np.array(y_shifts_feat)
+y_shifts_feat_ks = np.array(y_shifts_feat_ks)
 print(f"\nFeature shifts — mean: {y_shifts_feat.mean():.4f}, std: {y_shifts_feat.std():.4f}")
 
 
@@ -843,17 +850,22 @@ plt.tight_layout(); plt.show()
 # ============================================================
 
 SURROGATES = {
-    "Ridge":         Ridge(alpha=1.0),
-    "Decision Tree": DecisionTreeRegressor(max_depth=5, random_state=42),
-    "Random Forest": RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42, n_jobs=-1),
-    "SVR":           SVR(kernel="rbf", C=1.0),
-    "KNN":           KNeighborsRegressor(n_neighbors=5),
-    "XGBoost":       xgb.XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.1,
-                                       verbosity=0, random_state=42),
-    "LightGBM":      lgb.LGBMRegressor(n_estimators=100, max_depth=4, learning_rate=0.1,
-                                        random_state=42, verbose=-1),
+    "Ridge":             Ridge(alpha=1.0),
+    "Linear Regression": LinearRegression(),
+    "Lasso":             Lasso(alpha=0.001, max_iter=10000),
+    "ElasticNet":        ElasticNet(alpha=0.001, l1_ratio=0.5, max_iter=10000),
+    "Bayesian Ridge":    BayesianRidge(),
+    "Decision Tree":     DecisionTreeRegressor(max_depth=5, random_state=42),
+    "Random Forest":     RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42, n_jobs=-1),
+    "SVR":               SVR(kernel="rbf", C=1.0),
+    "KNN":               KNeighborsRegressor(n_neighbors=5),
+    "XGBoost":           xgb.XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.1,
+                                           verbosity=0, random_state=42),
+    "LightGBM":          lgb.LGBMRegressor(n_estimators=100, max_depth=4, learning_rate=0.1,
+                                            random_state=42, verbose=-1),
 }
-WEIGHT_SUPPORT = {"Ridge", "Decision Tree", "Random Forest", "XGBoost", "LightGBM"}
+WEIGHT_SUPPORT = {"Ridge", "Linear Regression", "Lasso", "ElasticNet", "Bayesian Ridge",
+                  "Decision Tree", "Random Forest", "XGBoost", "LightGBM"}
 
 geo_r2s = {}; feat_r2s = {}
 for name, model in SURROGATES.items():
@@ -1109,6 +1121,348 @@ add_basemap(ax)
 ax.legend()
 ax.set_title("Geo-SMILE: Top-10% High Spatial-Group Distributional Sensitivity", fontsize=15)
 ax.set_aspect("equal"); ax.set_axis_off()
+plt.tight_layout(); plt.show()
+
+
+# ============================================================
+# Step 30b: Distance Metrics for the Locality-Weighting Ablation
+# ============================================================
+# Five distance definitions are computed for BOTH branches, to be used as
+# the locality-weighting input to apply_kernel() in Step 31:
+#   1. Mask Cardinality : proportion of groups/players removed (existing).
+#   2. Input-Space      : mean per-property Euclidean distance, in
+#      standardized feature space, between original and perturbed vectors.
+#   3. Cosine            : mean per-property cosine distance between
+#      original and perturbed standardized feature vectors — the classic
+#      LIME-style locality metric.
+#   4. Wasserstein (input-side) : population-level 1-D Wasserstein distance
+#      between each affected feature's original values and its baseline
+#      replacement (a point mass) — SMILE's (Aslansefat et al.) signature
+#      move of using a statistical distance instead of a geometric one for
+#      locality weighting. NOT the same WD already used as the
+#      response/output-side target in Steps 6/9.
+#   5. WD + Cosine        : mean-normalised average of (3) and (4), mirroring
+#      the combined "WD+C" metric reported alongside SMILE/BayLIME.
+#
+# Cosine and Wasserstein are mathematically distinct from cardinality and
+# from each other (unlike e.g. Hamming/Euclidean/Jaccard on a binary mask
+# against a fixed zero reference, which all collapse to the same ranking) —
+# each genuinely reorders which perturbations count as "local".
+# ============================================================
+
+full_scaler   = StandardScaler().fit(X_train[features])
+X_train_std   = full_scaler.transform(X_train[features])
+baseline_std  = full_scaler.transform(pd.DataFrame([baseline_values[features].values], columns=features))[0]
+sq_diff_full  = (X_train_std - baseline_std) ** 2                       # (n_points, n_features)
+abs_diff_full = np.abs(X_train_std - baseline_std)                      # (n_points, n_features)
+
+player_cols = {p: [features.index(p)] for p in non_spatial_feats}
+player_cols["location"] = [features.index("UTM_X"), features.index("UTM_Y")]
+loc_cols    = player_cols["location"]
+sq_diff_by_player = np.column_stack([
+    sq_diff_full[:, player_cols[p]].sum(axis=1) for p in players
+])                                                                       # (n_points, n_players)
+
+# ---------- 2. Input-Space (Euclidean) ----------
+squared_dist_feat     = sq_diff_by_player @ M_feat.T                     # (n_points, K_feat)
+feat_dist_euclid_full = np.sqrt(squared_dist_feat).mean(axis=0)          # (K_feat,)
+
+dist_coord_euclid = np.sqrt(sq_diff_by_player[:, players.index("location")])  # (n_points,)
+geo_membership    = M_geo[:, spatial_group_labels]                            # (n_subsets, n_points)
+_denom_geo        = geo_membership.sum(axis=1)
+geo_dist_euclid_full = np.divide(geo_membership @ dist_coord_euclid, _denom_geo,
+                                  out=np.zeros(n_subsets), where=_denom_geo > 0)
+
+# ---------- 3. Cosine ----------
+# Geo branch only ever replaces UTM_X/UTM_Y, so the per-property cosine
+# distance between x_i and x_i-with-location-replaced never depends on j.
+_full_norm   = np.linalg.norm(X_train_std, axis=1)
+_xprime_loc  = X_train_std.copy()
+_xprime_loc[:, loc_cols] = baseline_std[loc_cols]
+_xprime_norm = np.linalg.norm(_xprime_loc, axis=1)
+_dot_loc     = (X_train_std * _xprime_loc).sum(axis=1)
+cos_dist_location_replaced = 1 - _dot_loc / (_full_norm * _xprime_norm + 1e-12)   # (n_points,)
+
+geo_dist_cosine_full = np.divide(geo_membership @ cos_dist_location_replaced, _denom_geo,
+                                  out=np.zeros(n_subsets), where=_denom_geo > 0)
+
+# Feature branch: the removed-column mask differs per perturbation, so cosine
+# is computed per (property, perturbation) via an algebraic identity that
+# avoids materialising every perturbed vector explicitly.
+col_to_player_idx = np.zeros(len(features), dtype=int)
+for pi, p in enumerate(players):
+    for c in player_cols[p]:
+        col_to_player_idx[c] = pi
+
+C_feat = M_feat[:, col_to_player_idx]                                    # (K_feat, n_features) in {0,1}
+V      = X_train_std ** 2                                                # (n_points, n_features)
+U      = V - X_train_std * baseline_std                                  # (n_points, n_features)
+w_sq   = baseline_std ** 2                                               # (n_features,)
+
+norm_x_sq = (X_train_std ** 2).sum(axis=1)                               # (n_points,)
+VC = V @ C_feat.T                                                        # (n_points, K_feat)
+UC = U @ C_feat.T                                                        # (n_points, K_feat)
+Cw = C_feat @ w_sq                                                       # (K_feat,)
+
+dot_mat        = norm_x_sq[:, None] - UC
+norm_xprime_sq = norm_x_sq[:, None] - VC + Cw[None, :]
+cos_sim_mat = dot_mat / (np.sqrt(np.clip(norm_x_sq[:, None], 1e-12, None)) *
+                          np.sqrt(np.clip(norm_xprime_sq, 1e-12, None)))
+feat_dist_cosine_full = (1 - cos_sim_mat).mean(axis=0)                   # (K_feat,)
+
+# ---------- 4. Wasserstein (input-side) ----------
+# WD between an empirical distribution and a point mass at the baseline
+# reduces to the mean absolute deviation from that point.
+MAD_col    = abs_diff_full.mean(axis=0)                                  # (n_features,) population-level
+MAD_player = np.array([MAD_col[player_cols[p]].mean() for p in players]) # (n_players,)
+
+_denom_feat = M_feat.sum(axis=1)
+feat_dist_wd_full = np.divide(M_feat @ MAD_player, _denom_feat,
+                               out=np.zeros(K_feat), where=_denom_feat > 0)
+
+_mad_x, _mad_y = abs_diff_full[:, loc_cols[0]], abs_diff_full[:, loc_cols[1]]
+_wd_x = np.divide(geo_membership @ _mad_x, _denom_geo, out=np.zeros(n_subsets), where=_denom_geo > 0)
+_wd_y = np.divide(geo_membership @ _mad_y, _denom_geo, out=np.zeros(n_subsets), where=_denom_geo > 0)
+geo_dist_wd_full = (_wd_x + _wd_y) / 2
+
+# ---------- 5. WD + Cosine (mean-normalised combination) ----------
+geo_dist_combined_full  = 0.5 * (geo_dist_cosine_full  / (geo_dist_cosine_full.mean()  + 1e-12) +
+                                  geo_dist_wd_full      / (geo_dist_wd_full.mean()      + 1e-12))
+feat_dist_combined_full = 0.5 * (feat_dist_cosine_full / (feat_dist_cosine_full.mean() + 1e-12) +
+                                  feat_dist_wd_full     / (feat_dist_wd_full.mean()     + 1e-12))
+
+DIST_FULL = {
+    "Mask Cardinality": {"geo": geo_input_dist,         "feature": feat_hamming_dist},
+    "Input-Space":      {"geo": geo_dist_euclid_full,   "feature": feat_dist_euclid_full},
+    "Cosine":           {"geo": geo_dist_cosine_full,   "feature": feat_dist_cosine_full},
+    "Wasserstein":      {"geo": geo_dist_wd_full,       "feature": feat_dist_wd_full},
+    "WD + Cosine":      {"geo": geo_dist_combined_full, "feature": feat_dist_combined_full},
+}
+
+
+# ============================================================
+# Step 31: Surrogate x Distance x Response Ablation (Thesis Evaluation Table)
+# ============================================================
+# Three axes are crossed, for both branches:
+#   - Surrogate (11, Step 24)
+#   - Locality distance (6): the 5 from Step 30b, PLUS "Response-Based" — the
+#     kernel is applied directly to the SAME statistical distance used as the
+#     regression target, matching the target pipeline diagram (where one
+#     "Geo-Statistical Distance" box feeds both the kernel-weighting step and
+#     the fitted regression). This is tested here as one option among six,
+#     not adopted as the only design, since weighting training perturbations
+#     by their own observed response is a different locality notion than
+#     weighting by input proximity — worth comparing empirically rather than
+#     assuming either is correct.
+#   - Response distance (2): Wasserstein (canonical, Steps 6/9) and
+#     Kolmogorov-Smirnov — an alternative "Geo-Statistical Distance" for the
+#     regression target itself, computed in the same Step 6/9 perturbation
+#     loops (no extra automl.predict calls).
+#
+# For each (branch, response, distance) triple the kernel SHAPE is re-selected
+# on the validation split (mirroring Steps 7/10), then every surrogate is fit
+# on TRAIN and scored on VALIDATION only — the held-out test set stays
+# reserved exclusively for the official Step 8/11 numbers.
+# ============================================================
+
+BRANCH_MASKS = {
+    "geo":     (M_geo_tr,  M_geo_va,  geo_tr_idx,  geo_va_idx),
+    "feature": (M_feat_tr, M_feat_va, feat_tr_idx, feat_va_idx),
+}
+RESPONSES = {
+    "Wasserstein": {"geo": y_shifts_geo,    "feature": y_shifts_feat},
+    "KS":          {"geo": y_shifts_geo_ks, "feature": y_shifts_feat_ks},
+}
+
+ablation_rows = []
+for branch, (M_tr_b, M_va_b, tr_idx_b, va_idx_b) in BRANCH_MASKS.items():
+    for resp_name, resp_lookup in RESPONSES.items():
+        resp_full          = resp_lookup[branch]
+        resp_tr_b, resp_va_b = resp_full[tr_idx_b], resp_full[va_idx_b]
+
+        dist_options = {name: lookup[branch] for name, lookup in DIST_FULL.items()}
+        dist_options["Response-Based"] = resp_full   # kernel applied to the response itself
+
+        for dist_name, d_full in dist_options.items():
+            d_tr = d_full[tr_idx_b]
+            best_k_d, _ = select_best_kernel(M_tr_b, M_va_b, d_tr, resp_tr_b, resp_va_b)
+            w_tr_d = np.clip(apply_kernel(d_tr, best_k_d), 1e-8, None)
+            for name, model in SURROGATES.items():
+                kw = {"sample_weight": w_tr_d} if name in WEIGHT_SUPPORT else {}
+                model.fit(M_tr_b, resp_tr_b, **kw)
+                r2 = r2_score(resp_va_b, model.predict(M_va_b))
+                ablation_rows.append({
+                    "Branch": branch, "Response": resp_name, "Distance": dist_name,
+                    "Kernel": best_k_d, "Surrogate": name, "Validation R2": r2,
+                })
+
+ablation_df = pd.DataFrame(ablation_rows)
+print("\n--- Surrogate x Distance x Response Ablation (validation R2) ---")
+display(ablation_df)
+
+ablation_pivots = {}
+for branch in BRANCH_MASKS:
+    for resp_name in RESPONSES:
+        sub = ablation_df[(ablation_df["Branch"] == branch) & (ablation_df["Response"] == resp_name)]
+        pivot = sub.pivot(index="Surrogate", columns="Distance", values="Validation R2") \
+                   .sort_values("Mask Cardinality", ascending=False)
+        ablation_pivots[(branch, resp_name)] = pivot
+        print(f"\n{branch.capitalize()} branch, {resp_name} response — Validation R2 by surrogate x distance:")
+        display(pivot)
+
+fig, axes = plt.subplots(2, 2, figsize=(20, 12))
+for ax, (branch, resp_name) in zip(axes.flatten(), ablation_pivots):
+    ablation_pivots[(branch, resp_name)].plot(kind="bar", ax=ax)
+    ax.set_title(f"{branch.capitalize()} Branch, {resp_name} Response")
+    ax.set_ylabel("Validation R2"); ax.set_xlabel("Surrogate")
+    ax.legend(title="Distance", fontsize=7); ax.grid(axis="y")
+plt.tight_layout(); plt.show()
+
+
+# ============================================================
+# Step 32: Five Example Perturbation Sets — Metrics + Maps (Geo & Feature)
+# ============================================================
+# Geo map: red = properties in the masked spatial groups for that draw.
+# Feature map: a feature-branch perturbation masks the SAME players for
+# every property (whole-population masking), so colour cannot encode
+# "which properties" the way the geo map does. Instead, colour flags
+# whether the "location" player (the only player with geographic meaning)
+# was removed in that draw; the full removed-player set is always given in
+# the title.
+# ============================================================
+
+_example_geo_j  = [0, 1, 2, 3, 4]
+_example_feat_j = [0, 1, 2, 3, 4]
+
+geo_example_rows = []
+for j in _example_geo_j:
+    sel_groups = np.where(M_geo[j] == 1)[0]
+    affected   = np.isin(spatial_group_labels, sel_groups)
+    geo_example_rows.append({
+        "Perturbation": j,
+        "Groups Masked": int(M_geo[j].sum()),
+        "Properties Affected": int(affected.sum()),
+        "Mask Cardinality": geo_input_dist[j],
+        "Input-Space":      geo_dist_euclid_full[j],
+        "Cosine":           geo_dist_cosine_full[j],
+        "Wasserstein":      geo_dist_wd_full[j],
+        "WD + Cosine":      geo_dist_combined_full[j],
+        "Response (output-side WD)": y_shifts_geo[j],
+        "Response (output-side KS)": y_shifts_geo_ks[j],
+    })
+geo_example_df = pd.DataFrame(geo_example_rows)
+print("\n--- Geo Branch: 5 Example Perturbations ---")
+display(geo_example_df)
+
+feat_example_rows = []
+for j in _example_feat_j:
+    removed = [p for pi, p in enumerate(players) if M_feat[j, pi] == 1]
+    feat_example_rows.append({
+        "Perturbation": j,
+        "Players Removed": ", ".join(removed) if removed else "(none)",
+        "Mask Cardinality": feat_hamming_dist[j],
+        "Input-Space":      feat_dist_euclid_full[j],
+        "Cosine":           feat_dist_cosine_full[j],
+        "Wasserstein":      feat_dist_wd_full[j],
+        "WD + Cosine":      feat_dist_combined_full[j],
+        "Response (output-side WD)": y_shifts_feat[j],
+        "Response (output-side KS)": y_shifts_feat_ks[j],
+    })
+feat_example_df = pd.DataFrame(feat_example_rows)
+print("\n--- Feature Branch: 5 Example Perturbations ---")
+display(feat_example_df)
+
+fig, axes = plt.subplots(1, 5, figsize=(26, 6))
+for ax, j in zip(axes, _example_geo_j):
+    sel_groups = np.where(M_geo[j] == 1)[0]
+    affected   = np.isin(spatial_group_labels, sel_groups)
+    gdf_train[~affected].plot(ax=ax, markersize=15, alpha=0.20, color="lightgrey")
+    gdf_train[affected].plot(ax=ax, markersize=50, color="red", alpha=0.85)
+    add_basemap(ax)
+    ax.set_title(f"Geo #{j}: {len(sel_groups)} groups\n{affected.sum()} properties masked", fontsize=11)
+    ax.set_aspect("equal"); ax.set_axis_off()
+fig.suptitle("Example Geo Perturbation Masks", fontsize=15, y=1.03)
+plt.tight_layout(); plt.show()
+
+fig, axes = plt.subplots(1, 5, figsize=(26, 6))
+for ax, j in zip(axes, _example_feat_j):
+    removed   = [p for pi, p in enumerate(players) if M_feat[j, pi] == 1]
+    loc_moved = "location" in removed
+    gdf_train.plot(ax=ax, markersize=20, alpha=0.7, color="red" if loc_moved else "lightgrey")
+    add_basemap(ax)
+    ax.set_title(f"Feature #{j}\nremoved: {', '.join(removed) if removed else '(none)'}", fontsize=9)
+    ax.set_aspect("equal"); ax.set_axis_off()
+fig.suptitle("Example Feature Perturbation Masks (red = 'location' player removed)", fontsize=15, y=1.03)
+plt.tight_layout(); plt.show()
+
+
+# ============================================================
+# Step 33: Fidelity vs. Number of Perturbations (Convergence)
+# ============================================================
+# Holds the surrogate (Ridge, the one actually used in Steps 8/11), the
+# locality distance (Mask Cardinality), and the kernel (best_k_geo/feat,
+# already selected in Steps 7/10) fixed, and varies only how many TRAINING
+# perturbations are used to fit it — by taking the first N rows of the
+# already-generated train pool, so no extra automl.predict() calls are
+# needed. Evaluated against the FULL validation set each time, so the
+# held-out side of the comparison stays constant across rows.
+# omega (kernel scale) is the median train-subsample distance used inside
+# apply_kernel for bandwidth-based kernels, or the max distance for "linear".
+# Weighted R2/WMSE/WMAE use the validation perturbations' own locality
+# weights (computed from their Mask Cardinality distance), so they answer
+# "how well does the surrogate fit the validation perturbations we'd
+# actually trust most", not just "fit on average".
+# ============================================================
+
+def _kernel_scale(d, kernel_type):
+    d = np.asarray(d, dtype=float)
+    return d.max() + 1e-12 if kernel_type == "linear" else np.median(d) + 1e-12
+
+
+def _convergence_rows(branch, M_tr_full, M_va_full, resp_tr_full, resp_va_full,
+                       dist_tr_full, dist_va_full, best_k, sizes):
+    rows = []
+    w_va = np.clip(apply_kernel(dist_va_full, best_k), 1e-8, None)
+    for n in sizes:
+        M_n, resp_n, dist_n = M_tr_full[:n], resp_tr_full[:n], dist_tr_full[:n]
+        w_n = np.clip(apply_kernel(dist_n, best_k), 1e-8, None)
+        ridge_n = Ridge(alpha=1.0)
+        ridge_n.fit(M_n, resp_n, sample_weight=w_n)
+        pred_va = ridge_n.predict(M_va_full)
+        resid   = resp_va_full - pred_va
+        rows.append({
+            "Branch": branch, "#Perturb": n, "Kernel": best_k,
+            "omega":        _kernel_scale(dist_n, best_k),
+            "R2":           r2_score(resp_va_full, pred_va),
+            "Weighted R2":  r2_score(resp_va_full, pred_va, sample_weight=w_va),
+            "WMSE":         np.average(resid ** 2, weights=w_va),
+            "WMAE":         np.average(np.abs(resid), weights=w_va),
+            "mean-L1":      mean_absolute_error(resp_va_full, pred_va),
+            "mean-L2":      np.sqrt(mean_squared_error(resp_va_full, pred_va)),
+        })
+    return rows
+
+
+PERTURB_SIZES_GEO  = [300, 600, 900, 1200, 1500, len(geo_tr_idx)]
+PERTURB_SIZES_FEAT = [300, 600, 900, 1200, 1500, len(feat_tr_idx)]
+
+convergence_rows  = _convergence_rows("geo", M_geo_tr, M_geo_va, sg_tr, sg_va,
+                                       gid_tr, gid_va, best_k_geo, PERTURB_SIZES_GEO)
+convergence_rows += _convergence_rows("feature", M_feat_tr, M_feat_va, sf_tr, sf_va,
+                                       fhd_tr, fhd_va, best_k_feat, PERTURB_SIZES_FEAT)
+
+convergence_df = pd.DataFrame(convergence_rows)
+print("\n--- Fidelity vs. Number of Perturbations (Convergence) ---")
+display(convergence_df)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for ax, branch in zip(axes, ["geo", "feature"]):
+    sub = convergence_df[convergence_df["Branch"] == branch]
+    ax.plot(sub["#Perturb"], sub["R2"], marker="o", label="R2")
+    ax.plot(sub["#Perturb"], sub["Weighted R2"], marker="s", label="Weighted R2")
+    ax.set_title(f"{branch.capitalize()} Branch: Fidelity vs. #Perturbations")
+    ax.set_xlabel("# Perturbations (training subsample)"); ax.set_ylabel("R2")
+    ax.legend(); ax.grid(alpha=0.3)
 plt.tight_layout(); plt.show()
 
 
